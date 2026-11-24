@@ -159,6 +159,8 @@ export function canAccessTab(
 ): boolean {
   if (!principal) return false;
   switch (tab) {
+    case 'overview':
+      return true;
     case 'codev':
       return hasPermission(principal, 'BoardsRead');
     case 'librarian':

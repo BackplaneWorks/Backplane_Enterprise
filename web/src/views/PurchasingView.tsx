@@ -1,20 +1,29 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { api } from '../api/endpoints';
+import { Empty, PageHead, Panel, Stat, Status, Tag, type Tone } from '../components/ui';
 import { useSession } from '../context/SessionContext';
+import { fmtTime, humanize, usd } from '../lib/format';
 import { hasPermission } from '../lib/rbac';
 import { escapeCsvCell, sanitizeExternalUrl, sanitizeServerRedirectUrl } from '../lib/safeUrl';
-import type { BomLine, OrderRecord, OrderState } from '../types/domain';
+import type { BomLine, OrderRecord, OrderState, PartLifecycle } from '../types/domain';
 
-const ORDER_BADGE: Record<OrderState, string> = {
-  draft: 'badge',
-  quote_requested: 'badge-cyan',
-  pending_approval: 'badge-amber',
-  ordered: 'badge-blue',
-  in_fabrication: 'badge-purple',
-  shipped: 'badge-cyan',
-  delivered: 'badge-green',
-  on_hold: 'badge-red',
-  cancelled: 'badge-red',
+const ORDER_TONE: Record<OrderState, Tone> = {
+  draft: 'plain',
+  quote_requested: 'plain',
+  pending_approval: 'warn',
+  ordered: 'accent',
+  in_fabrication: 'accent',
+  shipped: 'accent',
+  delivered: 'ok',
+  on_hold: 'bad',
+  cancelled: 'bad',
+};
+
+const LIFECYCLE_TONE: Record<PartLifecycle, Tone> = {
+  Draft: 'warn',
+  'In Review': 'accent',
+  Released: 'ok',
+  Obsolete: 'bad',
 };
 
 export const PurchasingView: React.FC = () => {
@@ -31,12 +40,32 @@ export const PurchasingView: React.FC = () => {
     setOrderEmails,
     notify,
     recordAudit,
+    navigate,
   } = useSession();
 
-  const [selectedBoardId, setSelectedBoardId] = useState(boards[0]?.id ?? 'brd-fc-rev4');
+  const [pickedBoardId, setSelectedBoardId] = useState(boards[0]?.id ?? '');
+  const selectedBoardId = boards.some((b) => b.id === pickedBoardId)
+    ? pickedBoardId
+    : (boards[0]?.id ?? '');
   const [buildQty, setBuildQty] = useState(25);
   const [alternatesLineId, setAlternatesLineId] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState('');
+
+  // Live tenants read the BOM for the chosen board; the sandbox carries its own.
+  useEffect(() => {
+    if (sandboxMode || !selectedBoardId) return;
+    let active = true;
+    api
+      .listBom(selectedBoardId)
+      .then((lines) => {
+        if (!active) return;
+        setBomLines((prev) => [...prev.filter((l) => l.boardId !== selectedBoardId), ...lines]);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [sandboxMode, selectedBoardId, setBomLines]);
 
   if (!principal) return null;
 
@@ -202,142 +231,169 @@ export const PurchasingView: React.FC = () => {
     }
   };
 
+  const hasBoard = selectedBoardId !== '';
+  const latestOrder = orders[0];
+
   return (
-    <div className="stack-md">
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Purchasing, BOM &amp; Encrypted Orders</h1>
-          <p className="page-subtitle">
-            Live BOM stock &amp; alternates, sanitized RFQ export, KMS-encrypted order ledger,
-            Stripe checkout, and Gmail/Microsoft 365 order tracking.
-          </p>
-        </div>
-
-        <div className="row">
-          <select
-            aria-label="BOM Board"
-            className="select"
-            value={selectedBoardId}
-            onChange={(e) => setSelectedBoardId(e.target.value)}
-          >
-            {boards.map((b) => (
-              <option key={b.id} value={b.id}>
-                {b.name}
-              </option>
-            ))}
-          </select>
-          <input
-            aria-label="Build Quantity"
-            className="input mono"
-            type="number"
-            min={1}
-            value={buildQty}
-            onChange={(e) => setBuildQty(Math.max(1, Number(e.target.value) || 1))}
-          />
-          <button type="button" className="btn btn-primary" onClick={handleExportRfqCsv}>
-            Export RFQ CSV
-          </button>
-        </div>
-      </div>
-
-      <div className="grid-4">
-        <div className="stat-card">
-          <div className="stat-label">BOM Unit Cost</div>
-          <div className="stat-value">${totalBomUnitUsd.toFixed(2)}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Extended ({buildQty} pcs)</div>
-          <div className="stat-value">${(totalBomUnitUsd * buildQty).toFixed(2)}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">EOL / Zero-Stock Alerts</div>
-          <div className="stat-value">{eolCount}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Encrypted Orders</div>
-          <div className="stat-value">{orders.length}</div>
-        </div>
-      </div>
-
-      <div className="card stack-md">
-        <div className="card-header">
-          <h3 className="card-title">Live BOM &amp; Supply Chain Readiness</h3>
-          <span className="badge badge-cyan">Fab Stock Sync</span>
-        </div>
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>RefDes</th>
-                <th>MPN</th>
-                <th>Lifecycle</th>
-                <th>Fab Stock</th>
-                <th>Unit USD</th>
-                <th>Alternates</th>
-              </tr>
-            </thead>
-            <tbody>
-              {boardBom.map((line) => (
-                <tr key={line.id}>
-                  <td className="mono">{line.refdes.join(', ')}</td>
-                  <td>
-                    <strong>{line.mpn}</strong>
-                    <div className="text-sm muted">{line.manufacturer}</div>
-                  </td>
-                  <td>
-                    <span
-                      className={`badge ${
-                        line.lifecycle === 'Obsolete'
-                          ? 'badge-red'
-                          : line.lifecycle === 'Released'
-                            ? 'badge-green'
-                            : 'badge-amber'
-                      }`}
-                    >
-                      {line.lifecycle}
-                    </span>
-                  </td>
-                  <td className="mono">{line.fabStockQty.toLocaleString()}</td>
-                  <td className="mono">${line.unitPriceUsd.toFixed(2)}</td>
-                  <td>
-                    {line.alternates.length > 0 && canWriteOrders ? (
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() =>
-                          setAlternatesLineId(alternatesLineId === line.id ? null : line.id)
-                        }
-                      >
-                        {line.alternates.length} Alternate(s)
-                      </button>
-                    ) : (
-                      <span className="muted text-sm">{line.alternates.length} available</span>
-                    )}
-                  </td>
-                </tr>
+    <>
+      <PageHead
+        num="03"
+        eyebrow="Orders"
+        title="Purchasing, BOM & Encrypted Orders"
+        sub="Live BOM stock and alternates, sanitized RFQ export, a KMS-encrypted order ledger, Stripe checkout and mailbox order tracking."
+      >
+        {hasBoard && (
+          <>
+            <select
+              aria-label="BOM Board"
+              className="select auto"
+              value={selectedBoardId}
+              onChange={(e) => setSelectedBoardId(e.target.value)}
+            >
+              {boards.map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
               ))}
-            </tbody>
-          </table>
-        </div>
+            </select>
+            <label className="row tight nowrap">
+              <span className="field-cap">Qty</span>
+              <input
+                aria-label="Build Quantity"
+                className="input mono w-qty"
+                type="number"
+                min={1}
+                value={buildQty}
+                onChange={(e) => setBuildQty(Math.max(1, Number(e.target.value) || 1))}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={boardBom.length === 0}
+              onClick={handleExportRfqCsv}
+            >
+              Export RFQ CSV
+            </button>
+          </>
+        )}
+      </PageHead>
+
+      <div className="stats">
+        <Stat label="BOM unit cost" value={usd(totalBomUnitUsd)} sub={`${boardBom.length} lines`} />
+        <Stat
+          label={`Extended · ${buildQty} pcs`}
+          value={usd(totalBomUnitUsd * buildQty)}
+          sub="parts only"
+        />
+        <Stat
+          label="EOL / zero stock"
+          value={eolCount}
+          tone={eolCount > 0 ? 'bad' : 'plain'}
+          sub={eolCount > 0 ? 'needs an alternate' : 'all lines sourceable'}
+        />
+        <Stat
+          label="Orders"
+          value={orders.length}
+          sub={`${orders.filter((o) => o.state === 'pending_approval').length} pending approval`}
+        />
+      </div>
+
+      <Panel
+        title="Bill of materials"
+        meta={hasBoard ? `${boardBom.length} lines · fab stock` : undefined}
+      >
+        {boardBom.length === 0 ? (
+          <Empty
+            title={hasBoard ? 'This board has no BOM lines yet' : 'No board to price yet'}
+            icon="orders"
+            actions={
+              !hasBoard && (
+                <button type="button" className="btn" onClick={() => navigate('codev')}>
+                  Go to boards
+                </button>
+              )
+            }
+          >
+            {hasBoard
+              ? 'BOM lines are extracted when a board revision is pushed with its schematic.'
+              : 'Once a board revision is pushed, its BOM appears here with live fab stock, pricing and drop-in alternates.'}
+          </Empty>
+        ) : (
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>RefDes</th>
+                  <th>MPN</th>
+                  <th>Lifecycle</th>
+                  <th className="r">Qty</th>
+                  <th className="r">Fab Stock</th>
+                  <th className="r">Unit USD</th>
+                  <th className="r">Alternates</th>
+                </tr>
+              </thead>
+              <tbody>
+                {boardBom.map((line) => (
+                  <tr key={line.id} className={line.id === alternatesLineId ? 'sel' : ''}>
+                    <td className="dim">{line.refdes.join(', ')}</td>
+                    <td>
+                      <strong className="cell-main">{line.mpn}</strong>
+                      <div className="cell-sub">{line.manufacturer}</div>
+                    </td>
+                    <td>
+                      <Status tone={LIFECYCLE_TONE[line.lifecycle]}>{line.lifecycle}</Status>
+                    </td>
+                    <td className="num r">{line.qtyPerBoard}</td>
+                    <td className={`num r${line.fabStockQty === 0 ? ' c-bad' : ''}`}>
+                      {line.fabStockQty.toLocaleString()}
+                    </td>
+                    <td className="num r">${line.unitPriceUsd.toFixed(2)}</td>
+                    <td className="r">
+                      {line.alternates.length > 0 && canWriteOrders ? (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() =>
+                            setAlternatesLineId(alternatesLineId === line.id ? null : line.id)
+                          }
+                        >
+                          {line.alternates.length} Alternate(s)
+                        </button>
+                      ) : (
+                        <span className="faint">{line.alternates.length} available</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
         {activeAltLine && (
-          <div className="comment-card stack-sm">
-            <div className="row-between">
-              <strong>Alternates for {activeAltLine.mpn}</strong>
+          <div className="alt-drawer">
+            <div className="between">
+              <span className="panel-title">Alternates for {activeAltLine.mpn}</span>
               <button
                 type="button"
-                className="btn btn-sm"
+                className="btn btn-ghost btn-sm"
                 onClick={() => setAlternatesLineId(null)}
               >
                 Close
               </button>
             </div>
             {activeAltLine.alternates.map((alt) => (
-              <div key={alt.mpn} className="row-between">
-                <div>
-                  <strong className="mono">{alt.mpn}</strong> ({alt.manufacturer}) — $
-                  {alt.unitPriceUsd.toFixed(2)} · Stock: {alt.fabStockQty.toLocaleString()}
-                  <div className="text-sm muted">{alt.notes}</div>
+              <div key={alt.mpn} className="between">
+                <div className="grow">
+                  <div>
+                    <strong className="cell-main">{alt.mpn}</strong>{' '}
+                    <span className="dim">
+                      {alt.manufacturer} · ${alt.unitPriceUsd.toFixed(2)} · stock{' '}
+                      {alt.fabStockQty.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="cell-sub prose">{alt.notes}</div>
                 </div>
                 <button
                   type="button"
@@ -350,151 +406,161 @@ export const PurchasingView: React.FC = () => {
             ))}
           </div>
         )}
-      </div>
+      </Panel>
 
-      <div className="split-pane-equal">
-        <div className="card stack-md">
-          <div className="card-header">
-            <h3 className="card-title">KMS Envelope-Encrypted Orders</h3>
-            <span className="badge badge-green">AES-256-GCM DEK</span>
-          </div>
-
-          {orders.map((order) => (
-            <div key={order.id} className="comment-card stack-sm">
-              <div className="row-between">
-                <strong className="mono">{order.orderNumber}</strong>
-                <span className={`badge ${ORDER_BADGE[order.state]}`}>{order.state}</span>
-              </div>
-              <div>{order.boardName}</div>
-              <div className="row-between text-sm muted mono">
-                <span>
-                  Total: ${(order.totalCents / 100).toFixed(2)} · Ref: {order.fabReference}
-                </span>
-                <span>DEK v{order.envelopeKeyVersion}</span>
-              </div>
-              <div className="text-sm muted mono">AAD: {order.aadBinding}</div>
-              {order.trackingNumber && (
-                <div className="text-sm mono">Tracking: {order.trackingNumber}</div>
-              )}
-
-              <div className="row">
-                {canApproveOrders && order.state === 'pending_approval' && (
-                  <button
-                    type="button"
-                    className="btn btn-success btn-sm"
-                    onClick={() => void handleTransitionOrder(order, 'ordered')}
-                  >
-                    Approve &amp; Place PO
-                  </button>
-                )}
-                {canWriteOrders && (
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm"
-                    onClick={() => void handleStripeCheckout(order)}
-                  >
-                    Pay via Stripe Checkout
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="card stack-md">
-          <div className="card-header">
-            <h3 className="card-title">Gmail &amp; Outlook Order Ingestion</h3>
-            <div className="row">
-              {canManageMail && (
-                <>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    onClick={() => void handleConnectMailbox('google')}
-                  >
-                    Connect Gmail
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    onClick={() => void handleConnectMailbox('microsoft')}
-                  >
-                    Connect Outlook
-                  </button>
-                </>
-              )}
-              <span className="badge badge-blue">{mailConnectors.length} Connected</span>
-            </div>
-          </div>
-
-          <div className="row">
-            {mailConnectors.map((mc) => (
-              <span
-                key={mc.id}
-                className={`badge ${mc.status === 'connected' ? 'badge-green' : 'badge-amber'}`}
-              >
-                {mc.provider === 'gmail' ? 'Gmail' : 'M365'}: {mc.mailboxEmail}
-              </span>
-            ))}
-          </div>
-
-          {orderEmails.map((evt) => (
-            <div key={evt.id} className="comment-card stack-sm">
-              <div className="row-between text-sm">
-                <strong className="mono">{evt.orderNumber}</strong>
-                <div className="row">
-                  {evt.senderVerified !== undefined && (
-                    <span
-                      className={`badge ${evt.senderVerified ? 'badge-green' : 'badge-amber'}`}
-                    >
-                      {evt.senderVerified ? 'DMARC Verified' : 'Unverified Sender'}
-                    </span>
-                  )}
-                  <span className="badge badge-cyan">
-                    Proposed: {evt.proposedState ?? 'none'} ({Math.round(evt.confidence * 100)}%)
+      <div className="cols-2">
+        <Panel title="Order ledger" meta="AES-256-GCM envelope">
+          {orders.length === 0 ? (
+            <Empty title="No orders yet" icon="key" variant="compact">
+              Orders are stored envelope-encrypted under this tenant&apos;s data key. They are
+              created when a board is sent to the fab from Backplane.
+            </Empty>
+          ) : (
+            orders.map((order) => (
+              <div key={order.id} className="item">
+                <div className="item-head">
+                  <strong className="cell-main">{order.orderNumber}</strong>
+                  <Tag tone={ORDER_TONE[order.state]}>{humanize(order.state)}</Tag>
+                </div>
+                <div className="between">
+                  <span className="trunc">
+                    {order.boardName} <span className="faint">× {order.quantity}</span>
                   </span>
+                  <span className="num nowrap">{usd(order.totalCents / 100)}</span>
+                </div>
+                <div className="item-meta break">
+                  ref {order.fabReference} · DEK v{order.envelopeKeyVersion} · AAD{' '}
+                  {order.aadBinding}
+                  {order.trackingNumber ? ` · tracking ${order.trackingNumber}` : ''} · updated{' '}
+                  {fmtTime(order.updatedAt)}
+                </div>
+
+                {(canWriteOrders || (canApproveOrders && order.state === 'pending_approval')) && (
+                  <div className="row tight">
+                    {canApproveOrders && order.state === 'pending_approval' && (
+                      <button
+                        type="button"
+                        className="btn btn-success btn-sm"
+                        onClick={() => void handleTransitionOrder(order, 'ordered')}
+                      >
+                        Approve &amp; Place PO
+                      </button>
+                    )}
+                    {canWriteOrders && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => void handleStripeCheckout(order)}
+                      >
+                        Pay via Stripe Checkout
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </Panel>
+
+        <Panel
+          title="Order mail"
+          meta={`${mailConnectors.length} mailbox${mailConnectors.length === 1 ? '' : 'es'}`}
+          actions={
+            canManageMail && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => void handleConnectMailbox('google')}
+                >
+                  Connect Gmail
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => void handleConnectMailbox('microsoft')}
+                >
+                  Connect Outlook
+                </button>
+              </>
+            )
+          }
+        >
+          {mailConnectors.length > 0 && (
+            <div className="panel-body row">
+              {mailConnectors.map((mc) => (
+                <Status key={mc.id} tone={mc.status === 'connected' ? 'ok' : 'warn'}>
+                  {mc.provider === 'gmail' ? 'gmail' : 'm365'} · {mc.mailboxEmail}
+                </Status>
+              ))}
+            </div>
+          )}
+
+          {orderEmails.length === 0 ? (
+            <Empty title="No order mail parsed" icon="mail" variant="compact">
+              {mailConnectors.length === 0
+                ? 'Connect the mailbox your fab replies to. Confirmations and shipping notices are parsed into proposed order states for you to apply.'
+                : 'Fab confirmations and shipping notices will appear here as proposed state changes.'}
+            </Empty>
+          ) : (
+            orderEmails.map((evt) => (
+              <div key={evt.id} className="item">
+                <div className="item-head">
+                  <strong className="cell-main">{evt.orderNumber}</strong>
+                  <div className="row tight nowrap">
+                    {evt.senderVerified !== undefined && (
+                      <Status tone={evt.senderVerified ? 'ok' : 'warn'}>
+                        {evt.senderVerified ? 'DMARC verified' : 'unverified sender'}
+                      </Status>
+                    )}
+                  </div>
+                </div>
+                <div>{evt.subject}</div>
+                <div className="dim prose">{evt.sanitizedPreview}</div>
+                <div className="between">
+                  <span className="item-meta trunc">
+                    {evt.sender} · proposes {evt.proposedState ? humanize(evt.proposedState) : 'nothing'}{' '}
+                    ({Math.round(evt.confidence * 100)}%)
+                  </span>
+                  {evt.applied ? (
+                    <Status tone="ok">applied</Status>
+                  ) : evt.proposedState && canManageMail ? (
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-primary"
+                      onClick={() => void handleApplyEmailStatus(evt.id)}
+                    >
+                      Apply State Transition
+                    </button>
+                  ) : (
+                    <Status tone="idle">no transition</Status>
+                  )}
                 </div>
               </div>
-              <div>{evt.subject}</div>
-              <div className="text-sm muted">{evt.sanitizedPreview}</div>
-              <div className="row-between">
-                <span className="text-sm muted">From: {evt.sender}</span>
-                {evt.applied ? (
-                  <span className="badge badge-green">Applied</span>
-                ) : evt.proposedState && canManageMail ? (
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-primary"
-                    onClick={() => void handleApplyEmailStatus(evt.id)}
-                  >
-                    Apply State Transition
-                  </button>
-                ) : (
-                  <span className="badge">No Transition</span>
-                )}
-              </div>
-            </div>
-          ))}
+            ))
+          )}
 
-          {canManageMail && orders[0] && (
-            <div className="row">
+          {canManageMail && latestOrder && (
+            <div className="panel-foot">
               <input
                 className="input"
-                placeholder="Send customer status update for latest order..."
+                aria-label="Customer status update"
+                placeholder={`Status update for ${latestOrder.orderNumber}...`}
                 value={statusNote}
                 onChange={(e) => setStatusNote(e.target.value)}
               />
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => void handleSendCustomerUpdate(orders[0].id)}
+                disabled={!statusNote.trim()}
+                onClick={() => void handleSendCustomerUpdate(latestOrder.id)}
               >
                 Send Status Email
               </button>
             </div>
           )}
-        </div>
+        </Panel>
       </div>
-    </div>
+    </>
   );
 };

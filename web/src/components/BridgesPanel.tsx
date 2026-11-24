@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../api/endpoints';
 import { useSession } from '../context/SessionContext';
 import { sanitizeExternalUrl } from '../lib/safeUrl';
+import { Empty, Panel, Status, Tag } from './ui';
 import type {
   BridgeConfig,
   BridgeDirection,
@@ -255,59 +256,141 @@ export const BridgesPanel: React.FC = () => {
   };
 
   return (
-    <div className="stack-md">
-      <div className="card stack-md">
-        <div className="card-header">
-          <div>
-            <h3 className="card-title">
-              External Bridges &amp; Scoped Agent Peers (Slack / Teams / Discord / Dots / Grok)
-            </h3>
-            <p className="text-sm muted">
-              Bidirectional native-signed webhooks and sandboxed MCP/A2A external peers
-              (boards:read &amp; boards:comment only — zero shell, zero private HTTP library, zero
-              secrets).
-            </p>
+    <>
+      {ephemeralSecret && (
+        <div className="note secret stack sm-gap" role="region" aria-label="One-time bridge secret">
+          <div className="between">
+            <strong className="c-warn">
+              One-Time Signing Credentials — {ephemeralSecret.bridgeName}
+            </strong>
+            <button type="button" className="btn btn-sm" onClick={() => setEphemeralSecret(null)}>
+              Dismiss Secret
+            </button>
           </div>
-          <span className="badge badge-cyan">HMAC / Ed25519 / RS256</span>
+          <div className="prose dim">
+            Shown once in memory only (never stored in browser storage). Copy now; it cannot be
+            retrieved again.
+          </div>
+          <pre className="code">
+            {[
+              `Inbound URL:  ${ephemeralSecret.inboundPath}`,
+              `A2A Peer URL: ${ephemeralSecret.a2aPath}`,
+              ephemeralSecret.inboundSecretOnce
+                ? `Inbound Secret:  ${ephemeralSecret.inboundSecretOnce}`
+                : null,
+              ephemeralSecret.outboundSecretOnce
+                ? `Outbound Secret: ${ephemeralSecret.outboundSecretOnce}`
+                : null,
+            ]
+              .filter(Boolean)
+              .join('\n')}
+          </pre>
         </div>
+      )}
 
-        {ephemeralSecret && (
-          <div className="comment-card stack-sm" role="region" aria-label="One-time bridge secret">
-            <div className="row-between">
-              <strong>One-Time Signing Credentials — {ephemeralSecret.bridgeName}</strong>
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => setEphemeralSecret(null)}
-              >
-                Dismiss Secret
-              </button>
-            </div>
-            <div className="text-sm muted">
-              Shown once in memory only (never stored in browser storage). Copy now; it cannot be
-              retrieved again.
-            </div>
-            <pre className="code-block">
-              {[
-                `Inbound URL:  ${ephemeralSecret.inboundPath}`,
-                `A2A Peer URL: ${ephemeralSecret.a2aPath}`,
-                ephemeralSecret.inboundSecretOnce
-                  ? `Inbound Secret:  ${ephemeralSecret.inboundSecretOnce}`
-                  : null,
-                ephemeralSecret.outboundSecretOnce
-                  ? `Outbound Secret: ${ephemeralSecret.outboundSecretOnce}`
-                  : null,
-              ]
-                .filter(Boolean)
-                .join('\n')}
-            </pre>
+      <Panel title="Bridges" meta={bridges.length ? `${bridges.length} configured` : undefined}>
+        {bridges.length === 0 ? (
+          <Empty title="No bridges yet" icon="bridge" variant="compact">
+            Connect a team channel or an external agent with the form below. Every bridge gets its
+            own signing secret and a sandboxed peer that can only read boards and leave comments.
+          </Empty>
+        ) : (
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Adapter</th>
+                  <th>Inbound endpoint</th>
+                  <th>Peer scopes</th>
+                  <th>Secret</th>
+                  <th>Status</th>
+                  <th className="r">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bridges.map((b) => (
+                  <tr key={b.id} className={b.enabled ? '' : 'off'}>
+                    <td>
+                      <strong className="cell-main">{b.name}</strong>
+                      <div className="cell-sub">{b.subscribedEvents.join(', ') || 'no events'}</div>
+                    </td>
+                    <td>
+                      <div>{b.kind}</div>
+                      <div className="cell-sub">{b.direction}</div>
+                    </td>
+                    <td className="dim break">{b.inboundPath}</td>
+                    <td>
+                      {b.peerEnabled ? (
+                        <div className="row tight">
+                          {b.peerScopes.length === 0 ? (
+                            <Tag>no scopes</Tag>
+                          ) : (
+                            b.peerScopes.map((scope) => <Tag key={scope}>{scope}</Tag>)
+                          )}
+                        </div>
+                      ) : (
+                        <span className="faint">peer off</span>
+                      )}
+                    </td>
+                    <td className="dim nowrap">{b.secretHint}</td>
+                    <td>
+                      <Status tone={b.enabled ? 'ok' : 'warn'}>
+                        {b.enabled ? 'enabled' : 'paused'}
+                      </Status>
+                    </td>
+                    <td className="r shrink">
+                      <div className="row tight nowrap">
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => void handleToggleEnabled(b)}
+                        >
+                          {b.enabled ? 'Pause' : 'Enable'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => void handleRotateSecret(b)}
+                        >
+                          Rotate Secret
+                        </button>
+                        {b.targetUrl && (
+                          <button
+                            type="button"
+                            className="btn btn-sm"
+                            onClick={() => void handleTestBridge(b)}
+                          >
+                            Send Test
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          onClick={() => void handleDeleteBridge(b)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
+      </Panel>
 
-        <form className="stack-sm" onSubmit={(e) => void handleCreateBridge(e)}>
-          <div className="grid-3">
-            <label className="field-label">
-              Bridge Name
+      <Panel title="New bridge" meta="HMAC · Ed25519 · RS256">
+        <div className="panel-note">
+          Natively signed webhooks in both directions, plus an optional MCP/A2A peer limited to{' '}
+          <code>boards:read</code> and <code>boards:comment</code>. Peers get no shell, no private
+          library and no secrets.
+        </div>
+        <form className="panel-body stack" onSubmit={(e) => void handleCreateBridge(e)}>
+          <div className="form-grid three">
+            <label className="field">
+              <span className="field-cap">Bridge Name</span>
               <input
                 className="input"
                 placeholder="Dots + Grok Hardware Bot"
@@ -316,8 +399,8 @@ export const BridgesPanel: React.FC = () => {
               />
             </label>
 
-            <label className="field-label">
-              Adapter
+            <label className="field">
+              <span className="field-cap">Adapter</span>
               <select
                 aria-label="Bridge Adapter"
                 className="select"
@@ -332,8 +415,8 @@ export const BridgesPanel: React.FC = () => {
               </select>
             </label>
 
-            <label className="field-label">
-              Direction
+            <label className="field">
+              <span className="field-cap">Direction</span>
               <select
                 aria-label="Bridge Direction"
                 className="select"
@@ -345,11 +428,9 @@ export const BridgesPanel: React.FC = () => {
                 <option value="outbound">Outbound Only</option>
               </select>
             </label>
-          </div>
 
-          <div className="grid-2">
-            <label className="field-label">
-              Outbound Webhook URL (https:// public host)
+            <label className="field span-2">
+              <span className="field-cap">Outbound Webhook URL (public https://)</span>
               <input
                 className="input mono"
                 placeholder="https://bots.example.com/dots/inbound"
@@ -358,8 +439,8 @@ export const BridgesPanel: React.FC = () => {
               />
             </label>
 
-            <label className="field-label">
-              Rate Limit (requests / min)
+            <label className="field">
+              <span className="field-cap">Rate Limit (requests / min)</span>
               <input
                 className="input mono"
                 type="number"
@@ -372,8 +453,8 @@ export const BridgesPanel: React.FC = () => {
           </div>
 
           {kind === 'discord' && (
-            <label className="field-label">
-              Discord Ed25519 Application Public Key (64 hex chars)
+            <label className="field">
+              <span className="field-cap">Discord Ed25519 Application Public Key (64 hex chars)</span>
               <input
                 className="input mono"
                 placeholder="64-hex Ed25519 public key"
@@ -384,8 +465,8 @@ export const BridgesPanel: React.FC = () => {
           )}
 
           {kind === 'teams' && (
-            <label className="field-label">
-              Microsoft Teams Bot App ID (JWT Audience)
+            <label className="field">
+              <span className="field-cap">Microsoft Teams Bot App ID (JWT Audience)</span>
               <input
                 className="input mono"
                 placeholder="00000000-0000-0000-0000-000000000000"
@@ -396,8 +477,8 @@ export const BridgesPanel: React.FC = () => {
           )}
 
           {kind === 'slack' && (
-            <label className="field-label">
-              Slack Target Channel (optional)
+            <label className="field">
+              <span className="field-cap">Slack Target Channel (optional)</span>
               <input
                 className="input mono"
                 placeholder="#hw-releases"
@@ -407,150 +488,70 @@ export const BridgesPanel: React.FC = () => {
             </label>
           )}
 
-          <div className="row">
-            <span className="text-sm muted">Subscribed Events:</span>
-            {ALL_EVENTS.map((ev) => (
-              <label key={ev} className="badge">
-                <input
-                  type="checkbox"
-                  checked={selectedEvents.includes(ev)}
-                  onChange={() => toggleEvent(ev)}
-                />
-                <span className="mono">{ev}</span>
-              </label>
-            ))}
-          </div>
-
-          <div className="row-between">
-            <div className="stack-sm">
-              <div className="row">
-                <label className="badge">
+          <div className="field">
+            <span className="field-cap">Subscribed Events</span>
+            <div className="row tight">
+              {ALL_EVENTS.map((ev) => (
+                <label key={ev} className="check">
                   <input
                     type="checkbox"
-                    checked={peerEnabled}
-                    onChange={(e) => setPeerEnabled(e.target.checked)}
+                    checked={selectedEvents.includes(ev)}
+                    onChange={() => toggleEvent(ev)}
                   />
-                  <span>Enable Sandboxed A2A Peer</span>
+                  <span>{ev}</span>
                 </label>
-                {peerEnabled && (
-                  <>
-                    <label className="badge">
-                      <input
-                        type="checkbox"
-                        checked={peerRead}
-                        onChange={(e) => setPeerRead(e.target.checked)}
-                      />
-                      <span className="mono">boards:read</span>
-                    </label>
-                    <label className="badge">
-                      <input
-                        type="checkbox"
-                        checked={peerComment}
-                        onChange={(e) => setPeerComment(e.target.checked)}
-                      />
-                      <span className="mono">boards:comment</span>
-                    </label>
-                  </>
-                )}
-              </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <span className="field-cap">Agent Peer</span>
+            <div className="row tight">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={peerEnabled}
+                  onChange={(e) => setPeerEnabled(e.target.checked)}
+                />
+                <span>Enable Sandboxed A2A Peer</span>
+              </label>
               {peerEnabled && (
-                <div className="text-sm muted">
-                  Proposals filed by this bridge are attributed to the bridge creator; under
-                  four-eyes approval policy, a different admin must approve them (unless
-                  self-approval is enabled).
-                </div>
+                <>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={peerRead}
+                      onChange={(e) => setPeerRead(e.target.checked)}
+                    />
+                    <span>boards:read</span>
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={peerComment}
+                      onChange={(e) => setPeerComment(e.target.checked)}
+                    />
+                    <span>boards:comment</span>
+                  </label>
+                </>
               )}
             </div>
+            {peerEnabled && (
+              <span className="field-hint">
+                Proposals filed by this bridge are attributed to the bridge creator; under four-eyes
+                approval policy, a different admin must approve them (unless self-approval is
+                enabled).
+              </span>
+            )}
+          </div>
 
+          <div>
             <button type="submit" className="btn btn-primary">
               Create Bridge
             </button>
           </div>
         </form>
-      </div>
-
-      <div className="card">
-        <h3 className="card-title">Configured External Bridges</h3>
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Adapter</th>
-                <th>Inbound Endpoint</th>
-                <th>Peer Sandbox</th>
-                <th>Secret</th>
-                <th>Status</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bridges.map((b) => (
-                <tr key={b.id}>
-                  <td>
-                    <strong>{b.name}</strong>
-                    <div className="text-sm muted mono">{b.subscribedEvents.join(', ')}</div>
-                  </td>
-                  <td>
-                    <span className="badge badge-blue mono">{b.kind}</span>
-                    <div className="text-sm muted">{b.direction}</div>
-                  </td>
-                  <td className="mono text-sm">{b.inboundPath}</td>
-                  <td>
-                    {b.peerEnabled ? (
-                      <span className="badge badge-cyan mono">
-                        {b.peerScopes.join(', ') || 'read-none'}
-                      </span>
-                    ) : (
-                      <span className="text-sm muted">Disabled</span>
-                    )}
-                  </td>
-                  <td className="mono text-sm">{b.secretHint}</td>
-                  <td>
-                    <span className={`badge ${b.enabled ? 'badge-green' : 'badge-amber'}`}>
-                      {b.enabled ? 'Enabled' : 'Paused'}
-                    </span>
-                  </td>
-                  <td>
-                    <div className="row">
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => void handleToggleEnabled(b)}
-                      >
-                        {b.enabled ? 'Pause' : 'Enable'}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => void handleRotateSecret(b)}
-                      >
-                        Rotate Secret
-                      </button>
-                      {b.targetUrl && (
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          onClick={() => void handleTestBridge(b)}
-                        >
-                          Send Test
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        onClick={() => void handleDeleteBridge(b)}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+      </Panel>
+    </>
   );
 };

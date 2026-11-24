@@ -20,8 +20,9 @@ import {
   buildSandboxPrincipal,
 } from '../data/sandboxData';
 import { isSandboxEnabled } from '../lib/env';
-import { canAccessTab, getDefaultTabForRole, normalizeRole } from '../lib/rbac';
+import { canAccessTab, getDefaultTabForRole, hasPermission, normalizeRole } from '../lib/rbac';
 import type {
+  AdminSection,
   ApprovalGate,
   AuditEntry,
   BillingSummary,
@@ -43,6 +44,48 @@ import type {
   Role,
 } from '../types/domain';
 
+const NAV_TABS: readonly NavTab[] = ['overview', 'codev', 'librarian', 'purchasing', 'admin'];
+const ADMIN_SECTIONS: readonly AdminSection[] = [
+  'llm',
+  'sso',
+  'vms',
+  'gates',
+  'bridges',
+  'billing',
+  'audit',
+];
+
+// A live tenant starts from nothing: synthetic demo records are only ever
+// loaded by `enterSandboxAsRole`, never shown as if they were real data.
+const EMPTY_LLM_POLICY: LlmPolicy = {
+  providers: [],
+  zdrRequired: false,
+  allowExternalMcp: false,
+  monthlyBudgetCents: null,
+};
+const EMPTY_KEY_INFO: KeyInfo = {
+  activeVersion: 0,
+  provider: 'local_kek',
+  lastRotatedAt: '',
+  wrappedDekFingerprint: '',
+};
+const EMPTY_BILLING: BillingSummary = {
+  planName: '—',
+  seatsActive: 0,
+  seatsIncluded: 0,
+  vmHoursThisCycle: 0,
+  estimatedInvoiceUsd: 0,
+  stripeCustomerLinked: false,
+};
+
+/** `#/admin/audit` -> { tab: 'admin', section: 'audit' } */
+function parseHash(hash: string): { tab: NavTab | null; section: AdminSection | null } {
+  const [rawTab, rawSection] = hash.replace(/^#\/?/, '').split('/');
+  const tab = NAV_TABS.find((t) => t === rawTab) ?? null;
+  const section = ADMIN_SECTIONS.find((sec) => sec === rawSection) ?? null;
+  return { tab, section };
+}
+
 export interface ToastMessage {
   kind: 'info' | 'success' | 'error';
   text: string;
@@ -54,6 +97,8 @@ interface SessionContextValue {
   sandboxMode: boolean;
   activeTab: NavTab;
   setActiveTab: (tab: NavTab) => void;
+  adminSection: AdminSection;
+  navigate: (tab: NavTab, section?: AdminSection) => void;
   toast: ToastMessage | null;
   notify: (kind: ToastMessage['kind'], text: string) => void;
   clearToast: () => void;
@@ -101,26 +146,25 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [loading, setLoading] = useState(true);
   const [sandboxMode, setSandboxMode] = useState(false);
   const [activeTab, setActiveTabState] = useState<NavTab>('codev');
+  const [adminSection, setAdminSection] = useState<AdminSection>('llm');
   const [toast, setToast] = useState<ToastMessage | null>(null);
 
-  const [boards, setBoards] = useState<BoardProject[]>(INITIAL_BOARDS);
-  const [parts, setParts] = useState<LibraryPart[]>(INITIAL_PARTS);
-  const [bomLines, setBomLines] = useState<BomLine[]>(INITIAL_BOM_LINES);
-  const [orders, setOrders] = useState<OrderRecord[]>(INITIAL_ORDERS);
-  const [mailConnectors, setMailConnectors] = useState<MailConnector[]>(INITIAL_MAIL_CONNECTORS);
-  const [orderEmails, setOrderEmails] = useState<OrderEmailEvent[]>(INITIAL_ORDER_EMAILS);
-  const [boatVms, setBoatVms] = useState<BoatVm[]>(INITIAL_BOAT_VMS);
-  const [llmPolicy, setLlmPolicy] = useState<LlmPolicy>(INITIAL_LLM_POLICY);
-  const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>(INITIAL_APPROVAL_GATES);
-  const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>(
-    INITIAL_PENDING_APPROVALS,
-  );
-  const [auditLogs, setAuditLogs] = useState<AuditEntry[]>(INITIAL_AUDIT_LOGS);
-  const [keyInfo, setKeyInfo] = useState<KeyInfo>(INITIAL_KEY_INFO);
-  const [billing, setBilling] = useState<BillingSummary>(INITIAL_BILLING);
-  const [idps, setIdps] = useState<IdpConfig[]>(INITIAL_IDPS);
-  const [users, setUsers] = useState<OrgUser[]>(INITIAL_USERS);
-  const [bridges, setBridges] = useState<BridgeConfig[]>(INITIAL_BRIDGES);
+  const [boards, setBoards] = useState<BoardProject[]>([]);
+  const [parts, setParts] = useState<LibraryPart[]>([]);
+  const [bomLines, setBomLines] = useState<BomLine[]>([]);
+  const [orders, setOrders] = useState<OrderRecord[]>([]);
+  const [mailConnectors, setMailConnectors] = useState<MailConnector[]>([]);
+  const [orderEmails, setOrderEmails] = useState<OrderEmailEvent[]>([]);
+  const [boatVms, setBoatVms] = useState<BoatVm[]>([]);
+  const [llmPolicy, setLlmPolicy] = useState<LlmPolicy>(EMPTY_LLM_POLICY);
+  const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([]);
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
+  const [keyInfo, setKeyInfo] = useState<KeyInfo>(EMPTY_KEY_INFO);
+  const [billing, setBilling] = useState<BillingSummary>(EMPTY_BILLING);
+  const [idps, setIdps] = useState<IdpConfig[]>([]);
+  const [users, setUsers] = useState<OrgUser[]>([]);
+  const [bridges, setBridges] = useState<BridgeConfig[]>([]);
 
   const notify = useCallback((kind: ToastMessage['kind'], text: string) => {
     setToast({ kind, text });
@@ -128,17 +172,72 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   const clearToast = useCallback(() => setToast(null), []);
 
-  const setActiveTab = useCallback(
-    (tab: NavTab) => {
-      if (canAccessTab(principal, tab)) {
-        setActiveTabState(tab);
-      }
+  const navigate = useCallback(
+    (tab: NavTab, section?: AdminSection) => {
+      if (!canAccessTab(principal, tab)) return;
+      setActiveTabState(tab);
+      if (tab === 'admin' && section) setAdminSection(section);
     },
     [principal],
   );
 
+  const setActiveTab = useCallback((tab: NavTab) => navigate(tab), [navigate]);
+
+  // Keep the place across reloads and make back/forward work: `#/tab[/section]`.
+  useEffect(() => {
+    if (!principal || typeof window === 'undefined') return;
+    const next = activeTab === 'admin' ? `#/admin/${adminSection}` : `#/${activeTab}`;
+    if (window.location.hash !== next) {
+      window.history.replaceState(null, '', next);
+    }
+  }, [principal, activeTab, adminSection]);
+
+  useEffect(() => {
+    if (!principal || typeof window === 'undefined') return;
+    const onHashChange = () => {
+      const { tab, section } = parseHash(window.location.hash);
+      if (tab && canAccessTab(principal, tab)) {
+        setActiveTabState(tab);
+        if (tab === 'admin' && section) setAdminSection(section);
+      }
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, [principal]);
+
+  const applyStores = useCallback((seed: 'sandbox' | 'empty') => {
+    const demo = seed === 'sandbox';
+    setBoards(demo ? INITIAL_BOARDS : []);
+    setParts(demo ? INITIAL_PARTS : []);
+    setBomLines(demo ? INITIAL_BOM_LINES : []);
+    setOrders(demo ? INITIAL_ORDERS : []);
+    setMailConnectors(demo ? INITIAL_MAIL_CONNECTORS : []);
+    setOrderEmails(demo ? INITIAL_ORDER_EMAILS : []);
+    setBoatVms(demo ? INITIAL_BOAT_VMS : []);
+    setLlmPolicy(demo ? INITIAL_LLM_POLICY : EMPTY_LLM_POLICY);
+    setApprovalGates(demo ? INITIAL_APPROVAL_GATES : []);
+    setPendingApprovals(demo ? INITIAL_PENDING_APPROVALS : []);
+    setAuditLogs(demo ? INITIAL_AUDIT_LOGS : []);
+    setKeyInfo(demo ? INITIAL_KEY_INFO : EMPTY_KEY_INFO);
+    setBilling(demo ? INITIAL_BILLING : EMPTY_BILLING);
+    setIdps(demo ? INITIAL_IDPS : []);
+    setUsers(demo ? INITIAL_USERS : []);
+    setBridges(demo ? INITIAL_BRIDGES : []);
+  }, []);
+
   const recordAudit = useCallback(
     (action: string, target: string) => {
+      if (!sandboxMode) {
+        // Live: the server writes the hash-chained entry. Re-read it instead of
+        // fabricating a local row that the chain would not contain.
+        if (hasPermission(principal, 'AuditRead')) {
+          api
+            .listAuditLogs()
+            .then(setAuditLogs)
+            .catch(() => undefined);
+        }
+        return;
+      }
       setAuditLogs((prev) => {
         const top = prev[0];
         const nextSeq = top ? top.seq + 1 : 1;
@@ -158,7 +257,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         return [entry, ...prev];
       });
     },
-    [principal?.email],
+    [principal, sandboxMode],
   );
 
   const loadLiveResources = useCallback(async (me: Principal) => {
@@ -223,7 +322,13 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         };
         setPrincipal(normalized);
         setSandboxMode(false);
-        setActiveTabState(getDefaultTabForRole(normalized.role));
+        const fromHash = typeof window === 'undefined' ? null : parseHash(window.location.hash);
+        if (fromHash?.tab && canAccessTab(normalized, fromHash.tab)) {
+          setActiveTabState(fromHash.tab);
+          if (fromHash.section) setAdminSection(fromHash.section);
+        } else {
+          setActiveTabState('overview');
+        }
         await loadLiveResources(normalized);
       } catch {
         if (!active) return;
@@ -240,14 +345,17 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const enterSandboxAsRole = useCallback((role: Role) => {
     if (!isSandboxEnabled()) return;
     const nextPrincipal = buildSandboxPrincipal(role);
+    // Seed once; switching preview role keeps edits made in the sandbox.
+    if (!sandboxMode) applyStores('sandbox');
     setPrincipal(nextPrincipal);
     setSandboxMode(true);
     setActiveTabState(getDefaultTabForRole(role));
+    setAdminSection('llm');
     setToast({
       kind: 'info',
       text: `Sandbox preview active as ${nextPrincipal.displayName} (${role}). No backend mutations sent.`,
     });
-  }, []);
+  }, [applyStores, sandboxMode]);
 
   const signOut = useCallback(async () => {
     if (!sandboxMode) {
@@ -260,7 +368,11 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setPrincipal(null);
     setSandboxMode(false);
     setToast(null);
-  }, [sandboxMode]);
+    applyStores('empty');
+    if (typeof window !== 'undefined' && window.location.hash) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+  }, [applyStores, sandboxMode]);
 
   return (
     <SessionContext.Provider
@@ -270,6 +382,8 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         sandboxMode,
         activeTab,
         setActiveTab,
+        adminSection,
+        navigate,
         toast,
         notify,
         clearToast,

@@ -23,7 +23,9 @@ export type Permission =
   | 'AdminManage'
   | 'AuditRead';
 
-export type NavTab = 'codev' | 'librarian' | 'purchasing' | 'admin';
+export type NavTab = 'overview' | 'codev' | 'librarian' | 'purchasing' | 'admin';
+
+export type AdminSection = 'llm' | 'sso' | 'vms' | 'gates' | 'bridges' | 'billing' | 'audit';
 
 export interface Principal {
   tenantId: string;
@@ -288,7 +290,7 @@ export interface AuditEntry {
   timestamp: string;
   actorKind?: string;
   actor?: string;
-  actorEmail: string;
+  actorEmail: string | null;
   action: string;
   target: string;
   details?: unknown;
@@ -312,6 +314,8 @@ export interface BillingSummary {
   vmHoursThisCycle: number;
   estimatedInvoiceUsd: number;
   stripeCustomerLinked: boolean;
+  subscriptionStatus?: string | null;
+  currentPeriodEnd?: string | null;
 }
 
 export type IdpProviderKind = 'google' | 'microsoft' | 'oidc' | 'saml';
@@ -337,7 +341,7 @@ export interface OrgUser {
   displayName: string;
   role: Role;
   status: 'active' | 'invited' | 'suspended';
-  lastLoginAt: string;
+  lastLoginAt: string | null;
 }
 
 export type BridgeKind = 'webhook' | 'slack' | 'teams' | 'discord' | 'a2a';

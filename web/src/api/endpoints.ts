@@ -52,6 +52,20 @@ export interface HttpLibTokenSummary {
   revokedAt?: string | null;
 }
 
+/**
+ * `/v1/admin/audit/verify`. The control plane answers `{ ok, entries, headSeq, headHash, error }`;
+ * `valid`/`count` are the older field names and are still accepted.
+ */
+export interface AuditVerifyResponse {
+  ok?: boolean;
+  entries?: number;
+  headSeq?: number;
+  headHash?: string;
+  error?: string | null;
+  valid?: boolean;
+  count?: number;
+}
+
 export interface CheckoutSessionResponse {
   checkoutUrl: string;
 }
@@ -219,7 +233,7 @@ export const api = {
     ),
   listAuditLogs: () => apiRequest<AuditEntry[]>('/v1/admin/audit'),
   verifyAuditChain: () =>
-    apiRequest<{ valid: boolean; count?: number }>('/v1/admin/audit/verify'),
+    apiRequest<AuditVerifyResponse>('/v1/admin/audit/verify'),
   getKeyInfo: () => apiRequest<KeyInfo>('/v1/admin/keys'),
   rotateTenantDek: () => apiRequest<KeyInfo>('/v1/admin/keys/rotate', { method: 'POST' }),
   getBillingSummary: () => apiRequest<BillingSummary>('/v1/billing/summary'),

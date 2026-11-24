@@ -1,15 +1,37 @@
 import React, { useState } from 'react';
 import { api } from '../api/endpoints';
 import { BridgesPanel } from '../components/BridgesPanel';
+import { Empty, PageHead, Panel, Stat, Status, Tag } from '../components/ui';
 import { useSession } from '../context/SessionContext';
+import { fmtTime, humanize, personName, shortHash, usd } from '../lib/format';
 import { roleLabel } from '../lib/rbac';
 import { sanitizeExternalUrl } from '../lib/safeUrl';
-import type { Role } from '../types/domain';
+import type { AdminSection, Role } from '../types/domain';
 
-type AdminSubTab = 'sso' | 'vms' | 'llm' | 'gates' | 'bridges' | 'billing' | 'audit';
+const SECTIONS: Array<[AdminSection, string]> = [
+  ['llm', 'LLM Policy & ZDR'],
+  ['sso', 'SSO & RBAC'],
+  ['vms', 'Boat VMs'],
+  ['gates', 'Approval Gates'],
+  ['bridges', 'External Bridges'],
+  ['billing', 'Mail & Stripe Billing'],
+  ['audit', 'KMS & Audit Log'],
+];
+
+const IDP_LABEL: Record<string, string> = {
+  google: 'Google Workspace',
+  microsoft: 'Microsoft Entra ID',
+  oidc: 'OpenID Connect',
+  saml: 'SAML 2.0',
+};
+
+type ChainState = 'unchecked' | 'valid' | 'broken';
 
 export const AdminView: React.FC = () => {
   const {
+    principal,
+    adminSection: subTab,
+    navigate,
     sandboxMode,
     users,
     setUsers,
@@ -31,9 +53,8 @@ export const AdminView: React.FC = () => {
     recordAudit,
   } = useSession();
 
-  const [subTab, setSubTab] = useState<AdminSubTab>('llm');
   const [newModel, setNewModel] = useState('');
-  const [chainStatus, setChainStatus] = useState<string>('Chain Verified');
+  const [chain, setChain] = useState<{ state: ChainState; count?: number }>({ state: 'unchecked' });
 
   const handleRoleChange = async (userId: string, role: Role) => {
     try {
@@ -121,13 +142,19 @@ export const AdminView: React.FC = () => {
   const handleVerifyAuditChain = async () => {
     try {
       if (sandboxMode) {
-        setChainStatus(`Chain Verified (${auditLogs.length} entries)`);
+        setChain({ state: 'valid', count: auditLogs.length });
         notify('success', 'Hash-chain integrity verified.');
         return;
       }
       const res = await api.verifyAuditChain();
-      setChainStatus(res.valid ? `Chain Verified (${res.count ?? auditLogs.length})` : 'Chain Mismatch');
-      notify(res.valid ? 'success' : 'error', res.valid ? 'Audit hash chain verified.' : 'Audit chain verification failed.');
+      const valid = res.ok ?? res.valid ?? false;
+      setChain({ state: valid ? 'valid' : 'broken', count: res.entries ?? res.count ?? auditLogs.length });
+      notify(
+        valid ? 'success' : 'error',
+        valid
+          ? 'Audit hash chain verified.'
+          : `Audit chain verification failed${res.error ? `: ${res.error}` : '.'}`,
+      );
     } catch (err) {
       notify('error', err instanceof Error ? err.message : 'Audit verification failed');
     }
@@ -198,35 +225,28 @@ export const AdminView: React.FC = () => {
     }
   };
 
-  return (
-    <div className="stack-md">
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Enterprise Admin Console</h1>
-          <p className="page-subtitle">
-            SSO &amp; RBAC, Zero-Tailscale Boat VM fleet, LLM allowlists &amp; optional ZDR policy,
-            approval gates, Stripe billing, KMS keys, and hash-chained audit logs.
-          </p>
-        </div>
-      </div>
+  const pendingCount = pendingApprovals.filter((a) => a.status === 'pending').length;
+  const vmsUp = boatVms.filter((vm) => vm.tunnelState === 'connected_mtls').length;
+  const seatsOver = billing.seatsIncluded > 0 && billing.seatsActive > billing.seatsIncluded;
 
-      <div className="tab-strip">
-        {(
-          [
-            ['sso', 'SSO & RBAC'],
-            ['vms', 'Boat VMs'],
-            ['llm', 'LLM Policy & ZDR'],
-            ['gates', 'Approval Gates'],
-            ['bridges', 'External Bridges'],
-            ['billing', 'Mail & Stripe Billing'],
-            ['audit', 'KMS & Audit Log'],
-          ] as Array<[AdminSubTab, string]>
-        ).map(([id, label]) => (
+  return (
+    <>
+      <PageHead
+        num="04"
+        eyebrow="Admin"
+        title="Enterprise Admin Console"
+        sub="Identity and roles, the Boat VM fleet, LLM routing policy, human approval gates, bridges, billing, tenant keys and the hash-chained audit log."
+      />
+
+      <div className="tabs" role="tablist">
+        {SECTIONS.map(([id, label]) => (
           <button
             key={id}
             type="button"
-            className={`tab-pill ${subTab === id ? 'active' : ''}`}
-            onClick={() => setSubTab(id)}
+            role="tab"
+            aria-selected={subTab === id}
+            className={`tab${subTab === id ? ' on' : ''}`}
+            onClick={() => navigate('admin', id)}
           >
             {label}
           </button>
@@ -234,336 +254,521 @@ export const AdminView: React.FC = () => {
       </div>
 
       {subTab === 'sso' && (
-        <div className="stack-md">
-          <div className="card stack-sm">
-            <h3 className="card-title">Identity Providers (Google Workspace / Entra / OIDC / SAML)</h3>
-            <div className="grid-3">
-              {idps.map((idp) => (
-                <div key={idp.id} className="stat-card stack-sm">
-                  <div className="row-between">
-                    <strong className="mono">{idp.provider}</strong>
-                    <span className={`badge ${idp.enabled ? 'badge-green' : 'badge'}`}>
-                      {idp.enabled ? 'Enabled' : 'Disabled'}
-                    </span>
-                  </div>
-                  <div className="text-sm muted">Verified domain: {idp.domain}</div>
-                  <div className="text-sm">
-                    {idp.enforcedSso ? 'Strict SSO Enforced' : 'Optional SSO'}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="card">
-            <h3 className="card-title">Organization Members &amp; RBAC</h3>
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>User</th>
-                    <th>Email</th>
-                    <th>Role</th>
-                    <th>Last Login</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {users.map((u) => (
-                    <tr key={u.id}>
-                      <td>{u.displayName}</td>
-                      <td className="mono">{u.email}</td>
-                      <td>
-                        <select
-                          aria-label={`Role for ${u.email}`}
-                          className="select"
-                          value={u.role}
-                          onChange={(e) => void handleRoleChange(u.id, e.target.value as Role)}
-                        >
-                          <option value="org_admin">Org Admin</option>
-                          <option value="engineer">Engineer</option>
-                          <option value="librarian">Librarian</option>
-                          <option value="purchasing">Purchasing</option>
-                          <option value="external_reviewer">External Reviewer</option>
-                        </select>
-                      </td>
-                      <td className="text-sm muted">{u.lastLoginAt}</td>
+        <>
+          <Panel title="Identity providers" meta={idps.length || undefined}>
+            {idps.length === 0 ? (
+              <Empty title="No identity provider configured" icon="people" variant="compact">
+                Members sign in through your IdP: Google Workspace, Microsoft Entra ID, any OIDC
+                issuer or SAML 2.0. Providers are registered with the control plane by the operator;
+                once one exists it is listed here with its verified domain and enforcement mode.
+              </Empty>
+            ) : (
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Provider</th>
+                      <th>Verified domain</th>
+                      <th>Enforcement</th>
+                      <th className="r">State</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+                  </thead>
+                  <tbody>
+                    {idps.map((idp) => (
+                      <tr key={idp.id} className={idp.enabled ? '' : 'off'}>
+                        <td>
+                          <div className="cell-main">
+                            {idp.displayName ?? IDP_LABEL[idp.provider] ?? idp.provider}
+                          </div>
+                          <div className="cell-sub">{idp.provider}</div>
+                        </td>
+                        <td>{idp.domain}</td>
+                        <td className="dim">
+                          {idp.enforcedSso ? 'SSO required' : 'SSO optional'}
+                        </td>
+                        <td className="r">
+                          <Status tone={idp.enabled ? 'ok' : 'idle'}>
+                            {idp.enabled ? 'enabled' : 'disabled'}
+                          </Status>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+
+          <Panel title="Members & roles" meta={users.length || undefined}>
+            {users.length === 0 ? (
+              <Empty title="No members" icon="people" variant="compact">
+                Members are provisioned on first SSO sign-in.
+              </Empty>
+            ) : (
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Member</th>
+                      <th>Email</th>
+                      <th>Status</th>
+                      <th>Last sign-in</th>
+                      <th className="r">Role</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {users.map((u) => (
+                      <tr key={u.id}>
+                        <td className="cell-main">
+                          {personName(u.displayName, u.email)}
+                          {u.id === principal?.userId && <span className="faint"> (you)</span>}
+                        </td>
+                        <td className="dim">{u.email}</td>
+                        <td>
+                          <Status
+                            tone={
+                              u.status === 'active' ? 'ok' : u.status === 'invited' ? 'accent' : 'bad'
+                            }
+                          >
+                            {u.status}
+                          </Status>
+                        </td>
+                        <td className="faint nowrap">{fmtTime(u.lastLoginAt, 'never')}</td>
+                        <td className="r shrink">
+                          <select
+                            aria-label={`Role for ${u.email}`}
+                            className="select auto"
+                            value={u.role}
+                            onChange={(e) => void handleRoleChange(u.id, e.target.value as Role)}
+                          >
+                            <option value="org_admin">Org Admin</option>
+                            <option value="engineer">Engineer</option>
+                            <option value="librarian">Librarian</option>
+                            <option value="purchasing">Purchasing</option>
+                            <option value="external_reviewer">External Reviewer</option>
+                          </select>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+        </>
       )}
 
       {subTab === 'vms' && (
-        <div className="card stack-md">
-          <div className="card-header">
-            <h3 className="card-title">Managed Boat VMs (Outbound mTLS Relay — Zero Tailscale)</h3>
-            <span className="badge badge-green">Cert TTL &lt;= 24h</span>
+        <>
+          <div className="stats">
+            <Stat label="Enrolled" value={boatVms.length} sub="managed KiCad seats" />
+            <Stat
+              label="On mTLS"
+              value={vmsUp}
+              tone={vmsUp > 0 ? 'ok' : 'plain'}
+              sub="outbound tunnels up"
+            />
+            <Stat
+              label="Metered this month"
+              value={
+                <>
+                  {boatVms.reduce((acc, vm) => acc + vm.meteredHoursMonth, 0).toFixed(1)}
+                  <small> h</small>
+                </>
+              }
+              sub="across the fleet"
+            />
+            <Stat label="Client cert TTL" value="≤ 24 h" sub="auto-renewed by the VM" />
           </div>
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>VM Name</th>
-                  <th>Assigned User</th>
-                  <th>KiCad</th>
-                  <th>Tunnel State</th>
-                  <th>Metered Hours</th>
-                  <th>Control</th>
-                </tr>
-              </thead>
-              <tbody>
-                {boatVms.map((vm) => (
-                  <tr key={vm.id}>
-                    <td className="mono">{vm.name}</td>
-                    <td>{vm.assignedUserEmail}</td>
-                    <td className="mono">{vm.kicadVersion}</td>
-                    <td>
-                      <span
-                        className={`badge ${
-                          vm.tunnelState === 'connected_mtls' ? 'badge-green' : 'badge-amber'
-                        }`}
-                      >
-                        {vm.tunnelState}
-                      </span>
-                    </td>
-                    <td className="mono">{vm.meteredHoursMonth.toFixed(1)} h</td>
-                    <td>
-                      {vm.tunnelState === 'stopped' ? (
-                        <button
-                          type="button"
-                          className="btn btn-success btn-sm"
-                          onClick={() => void handleToggleVm(vm.id, 'wake')}
-                        >
-                          Wake VM
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={() => void handleToggleVm(vm.id, 'stop')}
-                        >
-                          Stop VM
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+
+          <Panel title="Managed VM fleet" meta="outbound mTLS relay · no inbound ports">
+            {boatVms.length === 0 ? (
+              <Empty title="No Boat VMs enrolled" icon="vm" variant="canvas">
+                A Boat VM is a managed KiCad seat that dials out to the relay over mTLS, so nothing
+                listens on your network. Once the operator enrolls one for a member it appears here
+                with its tunnel state, certificate expiry and metered hours.
+              </Empty>
+            ) : (
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>VM</th>
+                      <th>Assigned to</th>
+                      <th>KiCad</th>
+                      <th>Tunnel</th>
+                      <th>Cert expires</th>
+                      <th className="r">Idle</th>
+                      <th className="r">Metered</th>
+                      <th className="r">Control</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {boatVms.map((vm) => (
+                      <tr key={vm.id}>
+                        <td>
+                          <div className="cell-main">{vm.name}</div>
+                          <div className="cell-sub">{vm.region}</div>
+                        </td>
+                        <td className="dim">{vm.assignedUserEmail}</td>
+                        <td>{vm.kicadVersion}</td>
+                        <td>
+                          <Status
+                            tone={
+                              vm.tunnelState === 'connected_mtls'
+                                ? 'ok'
+                                : vm.tunnelState === 'waking'
+                                  ? 'accent'
+                                  : 'idle'
+                            }
+                            pulse={vm.tunnelState === 'waking'}
+                          >
+                            {vm.tunnelState}
+                          </Status>
+                        </td>
+                        <td className="faint nowrap">{fmtTime(vm.certExpiresAt)}</td>
+                        <td className="num r">{vm.idleMinutes} min</td>
+                        <td className="num r">{vm.meteredHoursMonth.toFixed(1)} h</td>
+                        <td className="r shrink">
+                          {vm.tunnelState === 'stopped' ? (
+                            <button
+                              type="button"
+                              className="btn btn-success btn-sm"
+                              onClick={() => void handleToggleVm(vm.id, 'wake')}
+                            >
+                              Wake VM
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn btn-danger btn-sm"
+                              onClick={() => void handleToggleVm(vm.id, 'stop')}
+                            >
+                              Stop VM
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+        </>
       )}
 
       {subTab === 'llm' && (
-        <div className="card stack-md">
-          <div className="row-between">
-            <div>
-              <h3 className="card-title">LLM Provider Governance &amp; Optional ZDR Policy</h3>
-              <p className="text-sm muted">
-                Toggle Zero-Data-Retention (ZDR) enforcement based on your organization&apos;s own
-                LLM provider contract.
-              </p>
+        <>
+          <Panel
+            title="Routing policy"
+            actions={
+              <button
+                type="button"
+                role="switch"
+                aria-checked={llmPolicy.zdrRequired}
+                className="switch"
+                onClick={() => void handleToggleZdr()}
+              >
+                {llmPolicy.zdrRequired ? 'ZDR-Only Enforced: ON' : 'ZDR-Only Enforced: OFF'}
+              </button>
+            }
+          >
+            <div className="panel-note">
+              With ZDR-only on, agents may route only to providers under a zero-data-retention
+              contract. Turn it on if your organization&apos;s own provider agreement requires it.
             </div>
-            <button
-              type="button"
-              className={`btn ${llmPolicy.zdrRequired ? 'btn-success' : ''}`}
-              onClick={() => void handleToggleZdr()}
-            >
-              {llmPolicy.zdrRequired ? 'ZDR-Only Enforced: ON' : 'ZDR-Only Enforced: OFF'}
-            </button>
-          </div>
+            <dl className="kv flush wide">
+              <dt>Zero data retention</dt>
+              <dd className={llmPolicy.zdrRequired ? 'c-ok' : undefined}>
+                {llmPolicy.zdrRequired ? 'required for every request' : 'not required'}
+              </dd>
+              <dt>External MCP servers</dt>
+              <dd>{llmPolicy.allowExternalMcp ? 'allowed' : 'approval gated'}</dd>
+              <dt>Monthly budget</dt>
+              <dd>
+                {llmPolicy.monthlyBudgetCents !== null
+                  ? usd(llmPolicy.monthlyBudgetCents / 100)
+                  : 'no cap'}
+              </dd>
+            </dl>
+          </Panel>
 
-          <div className="row text-sm muted">
-            <span className="badge">
-              External MCP: {llmPolicy.allowExternalMcp ? 'Allowed' : 'Approval Gated'}
-            </span>
-            {llmPolicy.monthlyBudgetCents !== null && (
-              <span className="badge mono">
-                Monthly Cap: ${(llmPolicy.monthlyBudgetCents / 100).toFixed(2)}
-              </span>
-            )}
-          </div>
-
-          <div className="grid-3">
-            {llmPolicy.providers.map((prov) => (
-              <div key={prov.provider} className="stat-card stack-sm">
-                <div className="row-between">
-                  <strong>{prov.provider}</strong>
-                  <span className={`badge ${prov.zdr ? 'badge-green' : 'badge-amber'}`}>
-                    {prov.zdr ? 'ZDR' : 'Standard'}
-                  </span>
-                </div>
-                <div className="row">
-                  {prov.models.map((mod) => (
-                    <span key={mod} className="badge badge-cyan mono">
-                      {mod}
-                    </span>
-                  ))}
-                </div>
+          <Panel title="Provider allowlist" meta={llmPolicy.providers.length || undefined}>
+            {llmPolicy.providers.length === 0 ? (
+              <Empty title="No providers allowed" variant="compact">
+                Add a model ID below to start an allowlist. Until then agents cannot call any LLM.
+              </Empty>
+            ) : (
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Provider</th>
+                      <th>Allowed models</th>
+                      <th className="r">Retention</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {llmPolicy.providers.map((prov) => {
+                      const blocked = llmPolicy.zdrRequired && !prov.zdr;
+                      return (
+                        <tr key={prov.provider} className={blocked ? 'off' : ''}>
+                          <td className="cell-main shrink">{prov.provider}</td>
+                          <td>
+                            <div className="row tight">
+                              {prov.models.map((mod) => (
+                                <Tag key={mod}>{mod === '*' ? 'any model' : mod}</Tag>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="r shrink">
+                            {blocked ? (
+                              <Status tone="bad">blocked by ZDR-only</Status>
+                            ) : (
+                              <Status tone={prov.zdr ? 'ok' : 'idle'}>
+                                {prov.zdr ? 'ZDR' : 'standard'}
+                              </Status>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
-            ))}
-          </div>
-
-          <form className="row" onSubmit={(e) => void handleAddAllowedModel(e)}>
-            <input
-              className="input mono"
-              placeholder="Add allowed model ID (e.g. claude-haiku-4)"
-              value={newModel}
-              onChange={(e) => setNewModel(e.target.value)}
-            />
-            <button type="submit" className="btn btn-primary">
-              Allow Model
-            </button>
-          </form>
-        </div>
+            )}
+            <form className="panel-foot" onSubmit={(e) => void handleAddAllowedModel(e)}>
+              <input
+                className="input mono"
+                aria-label="Model ID"
+                placeholder="Add allowed model ID (e.g. claude-haiku-4)"
+                value={newModel}
+                onChange={(e) => setNewModel(e.target.value)}
+              />
+              <button type="submit" className="btn btn-primary btn-sm" disabled={!newModel.trim()}>
+                Allow Model
+              </button>
+            </form>
+          </Panel>
+        </>
       )}
 
       {subTab === 'gates' && (
-        <div className="split-pane-equal">
-          <div className="card stack-sm">
-            <h3 className="card-title">Mandatory Human Approval Gates</h3>
-            {approvalGates.map((gate) => (
-              <div key={gate.id} className="comment-card row-between">
-                <div>
-                  <strong className="mono">{gate.kind}</strong>
-                  <div className="text-sm muted">{gate.description}</div>
-                </div>
-                <button
-                  type="button"
-                  className={`btn btn-sm ${gate.enabled ? 'btn-success' : ''}`}
-                  onClick={() => void handleToggleGate(gate.id)}
-                >
-                  {gate.enabled ? 'Enabled' : 'Disabled'}
-                </button>
-              </div>
-            ))}
-          </div>
-
-          <div className="card stack-sm">
-            <h3 className="card-title">Pending Approval Queue</h3>
-            {pendingApprovals.map((item) => {
-              const summaryText =
-                typeof item.summary === 'string'
-                  ? item.summary
-                  : JSON.stringify(item.summary);
-              return (
-                <div key={item.id} className="comment-card stack-sm">
-                  <div className="row-between">
-                    <strong className="mono">{item.gateKind}</strong>
-                    <span
-                      className={`badge ${
-                        item.status === 'approved'
-                          ? 'badge-green'
-                          : item.status === 'rejected'
-                            ? 'badge-red'
-                            : 'badge-amber'
-                      }`}
+        <div className="cols-2">
+          <Panel title="Human approval gates" meta={approvalGates.length || undefined}>
+            {approvalGates.length === 0 ? (
+              <Empty title="No gates defined" icon="gate" variant="compact">
+                Gates force a human sign-off before an agent or member can take a risky action.
+              </Empty>
+            ) : (
+              approvalGates.map((gate) => (
+                <div key={gate.id} className="item">
+                  <div className="item-head">
+                    <strong className="cell-main">{gate.kind}</strong>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={gate.enabled}
+                      aria-label={`Gate ${gate.kind}`}
+                      className="switch sm"
+                      onClick={() => void handleToggleGate(gate.id)}
                     >
-                      {item.status}
-                    </span>
+                      {gate.enabled ? 'Enabled' : 'Disabled'}
+                    </button>
                   </div>
-                  <div>{summaryText}</div>
-                  <div className="text-sm muted">
-                    Requested by {item.requestedByEmail}
-                    {item.subject ? ` · ${item.subject}` : ''}
-                  </div>
-                  {item.status === 'pending' && (
-                    <div className="row">
-                      <button
-                        type="button"
-                        className="btn btn-success btn-sm"
-                        disabled={item.canDecide === false}
-                        onClick={() => void handleDecideApproval(item.id, 'approved')}
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        disabled={item.canDecide === false}
-                        onClick={() => void handleDecideApproval(item.id, 'rejected')}
-                      >
-                        Reject
-                      </button>
-                      {item.canDecide === false && (
-                        <span className="text-sm muted">Four-eyes: requires a second approver</span>
-                      )}
+                  <div className="dim prose">{gate.description}</div>
+                  {(gate.approvers?.length || gate.thresholdCents) && (
+                    <div className="item-meta">
+                      {gate.approvers?.length ? `approvers: ${gate.approvers.join(', ')}` : ''}
+                      {gate.approvers?.length && gate.thresholdCents ? ' · ' : ''}
+                      {gate.thresholdCents ? `over ${usd(gate.thresholdCents / 100)}` : ''}
                     </div>
                   )}
                 </div>
-              );
-            })}
-          </div>
+              ))
+            )}
+          </Panel>
+
+          <Panel title="Approval queue" meta={`${pendingCount} pending`}>
+            {pendingApprovals.length === 0 ? (
+              <Empty title="Queue is clear" icon="gate" variant="compact">
+                Requests that trip a gate wait here for a second person. Nobody can approve their
+                own request.
+              </Empty>
+            ) : (
+              pendingApprovals.map((item) => {
+                const summaryText =
+                  typeof item.summary === 'string' ? item.summary : JSON.stringify(item.summary);
+                return (
+                  <div key={item.id} className="item">
+                    <div className="item-head">
+                      <strong className="cell-main">{item.gateKind}</strong>
+                      <Tag
+                        tone={
+                          item.status === 'approved'
+                            ? 'ok'
+                            : item.status === 'rejected'
+                              ? 'bad'
+                              : 'warn'
+                        }
+                      >
+                        {item.status}
+                      </Tag>
+                    </div>
+                    <div className="prose">{summaryText}</div>
+                    <div className="item-meta">
+                      {item.requestedByEmail}
+                      {item.subject ? ` · ${item.subject}` : ''} · {fmtTime(item.createdAt)}
+                    </div>
+                    {item.status === 'pending' && (
+                      <div className="row tight">
+                        <button
+                          type="button"
+                          className="btn btn-success btn-sm"
+                          disabled={item.canDecide === false}
+                          onClick={() => void handleDecideApproval(item.id, 'approved')}
+                        >
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          disabled={item.canDecide === false}
+                          onClick={() => void handleDecideApproval(item.id, 'rejected')}
+                        >
+                          Reject
+                        </button>
+                        {item.canDecide === false && (
+                          <span className="faint">Four-eyes: requires a second approver</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </Panel>
         </div>
       )}
 
       {subTab === 'bridges' && <BridgesPanel />}
 
       {subTab === 'billing' && (
-        <div className="stack-md">
-          <div className="grid-4">
-            <div className="stat-card">
-              <div className="stat-label">Plan</div>
-              <div className="stat-value">{billing.planName}</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-label">Seats Active</div>
-              <div className="stat-value">
-                {billing.seatsActive}/{billing.seatsIncluded}
-              </div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-label">Boat VM Hours</div>
-              <div className="stat-value">{billing.vmHoursThisCycle} h</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-label">Est. Cycle Invoice</div>
-              <div className="stat-value">${billing.estimatedInvoiceUsd.toFixed(2)}</div>
-            </div>
+        <>
+          <div className="stats">
+            <Stat
+              label="Plan"
+              value={<span className="stat-text">{billing.planName}</span>}
+              sub={billing.subscriptionStatus ? humanize(billing.subscriptionStatus) : undefined}
+            />
+            <Stat
+              label="Seats"
+              value={
+                <>
+                  {billing.seatsActive}
+                  <small> / {billing.seatsIncluded} included</small>
+                </>
+              }
+              tone={seatsOver ? 'warn' : 'plain'}
+              sub={seatsOver ? 'over the included count' : 'active members'}
+            />
+            <Stat
+              label="VM hours"
+              value={
+                <>
+                  {billing.vmHoursThisCycle}
+                  <small> h</small>
+                </>
+              }
+              sub="this cycle"
+            />
+            <Stat
+              label="Est. invoice"
+              value={usd(billing.estimatedInvoiceUsd)}
+              sub={
+                billing.currentPeriodEnd
+                  ? `period ends ${fmtTime(billing.currentPeriodEnd)}`
+                  : 'this cycle'
+              }
+            />
           </div>
 
-          <div className="card row-between">
-            <div>
-              <h3 className="card-title">Stripe Subscription &amp; Usage Metering</h3>
-              <div className="text-sm muted">
-                Connected Mailboxes: {mailConnectors.map((m) => m.mailboxEmail).join(', ')}
-              </div>
-            </div>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => void handleOpenBillingPortal()}
-            >
-              Open Stripe Billing Portal
-            </button>
-          </div>
-        </div>
+          <Panel
+            title="Subscription"
+            meta="Stripe"
+            actions={
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => void handleOpenBillingPortal()}
+              >
+                Open Stripe Billing Portal
+              </button>
+            }
+          >
+            <dl className="kv flush wide">
+              <dt>Stripe customer</dt>
+              <dd className={billing.stripeCustomerLinked ? 'c-ok' : 'faint'}>
+                {billing.stripeCustomerLinked ? 'linked' : 'not linked'}
+              </dd>
+              <dt>Subscription</dt>
+              <dd>{billing.subscriptionStatus ? humanize(billing.subscriptionStatus) : '—'}</dd>
+              <dt>Order mailboxes</dt>
+              <dd>
+                {mailConnectors.length === 0
+                  ? 'none connected'
+                  : mailConnectors.map((m) => m.mailboxEmail).join(', ')}
+              </dd>
+            </dl>
+          </Panel>
+        </>
       )}
 
       {subTab === 'audit' && (
-        <div className="stack-md">
-          <div className="card row-between">
-            <div>
-              <h3 className="card-title">Per-Tenant KMS Envelope Encryption</h3>
-              <div className="text-sm mono muted">
-                Active DEK v{keyInfo.activeVersion} · Provider: {keyInfo.provider}
-                {keyInfo.kekId ? ` (${keyInfo.kekId})` : ''} · Fingerprint:{' '}
-                {keyInfo.wrappedDekFingerprint}
-              </div>
-            </div>
-            <button type="button" className="btn btn-primary" onClick={() => void handleRotateDek()}>
-              Rotate Tenant DEK
-            </button>
-          </div>
+        <>
+          <Panel
+            title="Tenant encryption key"
+            meta="envelope encryption"
+            actions={
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => void handleRotateDek()}
+              >
+                Rotate Tenant DEK
+              </button>
+            }
+          >
+            <dl className="kv flush wide">
+              <dt>Active DEK</dt>
+              <dd>{keyInfo.activeVersion > 0 ? `v${keyInfo.activeVersion}` : '—'}</dd>
+              <dt>Key provider</dt>
+              <dd>
+                {keyInfo.provider}
+                {keyInfo.kekId ? ` · ${keyInfo.kekId}` : ''}
+              </dd>
+              <dt>Wrapped DEK fingerprint</dt>
+              <dd>{keyInfo.wrappedDekFingerprint || '—'}</dd>
+              <dt>Last rotated</dt>
+              <dd>{fmtTime(keyInfo.lastRotatedAt)}</dd>
+            </dl>
+          </Panel>
 
-          <div className="card stack-sm">
-            <div className="card-header">
-              <h3 className="card-title">Tamper-Evident Hash-Chained Audit Log</h3>
-              <div className="row">
-                <span className="badge badge-green">{chainStatus}</span>
+          <Panel
+            title="Audit log"
+            meta={`${auditLogs.length} entries · hash-chained`}
+            actions={
+              <>
+                <Status
+                  tone={chain.state === 'valid' ? 'ok' : chain.state === 'broken' ? 'bad' : 'idle'}
+                >
+                  {chain.state === 'valid'
+                    ? `chain verified · ${chain.count ?? auditLogs.length} entries`
+                    : chain.state === 'broken'
+                      ? 'chain mismatch'
+                      : 'not verified this session'}
+                </Status>
                 <button
                   type="button"
                   className="btn btn-sm"
@@ -571,37 +776,49 @@ export const AdminView: React.FC = () => {
                 >
                   Verify Chain
                 </button>
-              </div>
-            </div>
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Seq</th>
-                    <th>Timestamp</th>
-                    <th>Actor</th>
-                    <th>Action</th>
-                    <th>Target</th>
-                    <th>Entry Hash</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {auditLogs.map((entry) => (
-                    <tr key={entry.seq}>
-                      <td className="mono">#{entry.seq}</td>
-                      <td className="text-sm muted">{entry.timestamp}</td>
-                      <td className="mono text-sm">{entry.actorEmail}</td>
-                      <td className="mono">{entry.action}</td>
-                      <td className="mono">{entry.target}</td>
-                      <td className="mono text-sm">{entry.entryHash}</td>
+              </>
+            }
+          >
+            {auditLogs.length === 0 ? (
+              <Empty title="No audit entries" variant="compact">
+                Each entry commits to the one before it, so any edit or deletion breaks the chain.
+              </Empty>
+            ) : (
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th className="shrink">Seq</th>
+                      <th>Timestamp</th>
+                      <th>Actor</th>
+                      <th>Action</th>
+                      <th>Target</th>
+                      <th>Prev → Entry hash</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+                  </thead>
+                  <tbody>
+                    {auditLogs.map((entry) => (
+                      <tr key={entry.seq}>
+                        <td className="num faint shrink">#{entry.seq}</td>
+                        <td className="dim nowrap">{fmtTime(entry.timestamp)}</td>
+                        <td className="dim">{entry.actorEmail ?? entry.actor ?? 'system'}</td>
+                        <td className="cell-main">{entry.action}</td>
+                        <td className="break">{entry.target}</td>
+                        <td className="nowrap">
+                          <span className="faint" title={entry.prevHash}>
+                            {shortHash(entry.prevHash)} →{' '}
+                          </span>
+                          <span title={entry.entryHash}>{shortHash(entry.entryHash)}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+        </>
       )}
-    </div>
+    </>
   );
 };

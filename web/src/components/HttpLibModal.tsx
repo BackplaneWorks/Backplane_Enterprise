@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api, type HttpLibTokenSummary } from '../api/endpoints';
 import { useSession } from '../context/SessionContext';
+import { fmtTime } from '../lib/format';
 import { buildKicadHttpLibConfig } from '../lib/safeUrl';
+import { Status } from './ui';
 
 interface HttpLibModalProps {
   open: boolean;
@@ -90,75 +92,123 @@ export const HttpLibModal: React.FC<HttpLibModalProps> = ({ open, onClose }) => 
   };
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="KiCad HTTP Library Setup">
-      <div className="modal-panel stack-md">
-        <div className="row-between">
-          <h3 className="card-title">Generate {principal.tenantSlug}.kicad_httplib</h3>
-          <button type="button" className="btn btn-sm" onClick={handleClose}>
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="KiCad HTTP Library Setup"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') handleClose();
+      }}
+    >
+      <div className="modal">
+        <header className="panel-head">
+          <div className="row tight nowrap trunc">
+            <h3 className="panel-title">Connect KiCad</h3>
+            <span className="panel-meta">{principal.tenantSlug}.kicad_httplib</span>
+          </div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={handleClose}>
             Close
           </button>
-        </div>
+        </header>
 
-        <p className="text-sm muted">
-          Tenant-isolated <code>kicad_httplib</code> v1 configuration. Tokens are SHA-256 hashed
-          on the server, never stored in browser storage, and cleared from memory when you close
-          this dialog.
-        </p>
+        <div className="modal-body">
+          <p className="prose dim">
+            A tenant-isolated <code>kicad_httplib</code> v1 configuration. Tokens are SHA-256 hashed
+            on the server, never stored in browser storage, and cleared from memory when you close
+            this dialog.
+          </p>
 
-        <div className="row">
-          <label className="field-label">
-            <span>Token Label</span>
-            <input
-              className="input"
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-              placeholder="e.g. macbook-kicad-10"
-            />
-          </label>
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={busy}
-            onClick={() => void handleMintToken()}
-          >
-            {busy ? 'Minting...' : 'Mint Scoped Bearer Token'}
-          </button>
-        </div>
+          <div className="step">
+            <span className="step-box">1</span>
+            <div className="grow stack sm-gap">
+              <div className="cell-main">Mint a token for this workstation</div>
+              <div className="row nowrap">
+                <input
+                  className="input mono"
+                  aria-label="Token Label"
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  placeholder="e.g. macbook-kicad-10"
+                />
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={busy}
+                  onClick={() => void handleMintToken()}
+                >
+                  {busy ? 'Minting...' : 'Mint Scoped Bearer Token'}
+                </button>
+              </div>
+            </div>
+          </div>
 
-        <pre className="code-block">{configJson}</pre>
-
-        {tokens.length > 0 && (
-          <div className="stack-sm">
-            <div className="text-sm muted">Active Scoped Device Tokens</div>
-            {tokens.map((tok) => (
-              <div key={tok.id} className="comment-card row-between text-sm">
-                <span className="mono">
-                  {tok.label} ({tok.tokenPrefix}...)
+          <div className="step">
+            <span className={`step-box${ephemeralToken ? ' done' : ''}`}>2</span>
+            <div className="grow stack sm-gap">
+              <div className="between">
+                <div className="cell-main">Download the library file</div>
+                {ephemeralToken ? (
+                  <Status tone="ok">token embedded · shown once</Status>
+                ) : (
+                  <Status tone="idle">waiting for a token</Status>
+                )}
+              </div>
+              <pre className="code">{configJson}</pre>
+              <div className="between">
+                <span className="faint break">
+                  /v1/httplib/{principal.tenantSlug}/categories.json
                 </span>
                 <button
                   type="button"
-                  className="btn btn-danger btn-sm"
-                  onClick={() => void handleRevokeToken(tok.id)}
+                  className="btn btn-success"
+                  disabled={!ephemeralToken}
+                  onClick={handleDownload}
                 >
-                  Revoke
+                  Download {principal.tenantSlug}.kicad_httplib
                 </button>
               </div>
-            ))}
+            </div>
           </div>
-        )}
 
-        <div className="row-between">
-          <span className="text-sm muted">
-            Endpoint: <code>/v1/httplib/{principal.tenantSlug}/categories.json</code>
-          </span>
-          <button
-            type="button"
-            className="btn btn-success"
-            disabled={!ephemeralToken}
-            onClick={handleDownload}
-          >
-            Download {principal.tenantSlug}.kicad_httplib
-          </button>
+          <div className="step">
+            <span className="step-box">3</span>
+            <div className="grow">
+              <div className="cell-main">Add it in KiCad</div>
+              <div className="prose dim">
+                Preferences → Manage Symbol Libraries → add the file as an HTTP library. Released
+                parts appear in the symbol chooser.
+              </div>
+            </div>
+          </div>
+
+          {tokens.length > 0 && (
+            <section className="panel">
+              <header className="panel-head">
+                <h4 className="panel-title">Active device tokens</h4>
+                <span className="panel-meta">{tokens.length}</span>
+              </header>
+              {tokens.map((tok) => (
+                <div key={tok.id} className="item">
+                  <div className="item-head">
+                    <span className="trunc">
+                      <span className="cell-main">{tok.label}</span>{' '}
+                      <span className="faint">
+                        {tok.tokenPrefix}… · created {fmtTime(tok.createdAt)}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-danger btn-sm"
+                      onClick={() => void handleRevokeToken(tok.id)}
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </section>
+          )}
         </div>
       </div>
     </div>
