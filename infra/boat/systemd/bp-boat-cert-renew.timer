@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew Backplane Boat mTLS Certificate every 18 hours (before 24h expiry)
+
+[Timer]
+OnBootSec=18h
+OnUnitActiveSec=18h
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

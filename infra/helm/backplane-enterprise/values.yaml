@@ -1,0 +1,112 @@
+global:
+  publicOrigin: "https://enterprise.example.com"
+  apiBaseUrl: "https://enterprise.example.com"
+  insecureCookies: "0"
+  trustedProxyHops: "1"
+  rustLog: "info"
+
+image:
+  registry: ghcr.io/backplaneworks
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+# Unified single-binary deployment (`bp-ent-api serve`) serving Portal (/app/web),
+# HTTP API, Desktop WSS relay (:8080), and Boat mTLS (:8443) in one lean pod.
+api:
+  replicaCount: 2
+  image: backplane-enterprise-api
+  port: 8080
+  mtlsPort: 8443
+  mtlsServiceType: LoadBalancer
+  mtlsServiceAnnotations: {}
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+relay:
+  enabled: true
+  mtlsHost: "relay.enterprise.example.com"
+  idleTimeoutSecs: 900
+  standalone:
+    enabled: false
+    replicaCount: 1
+    image: backplane-enterprise-relay
+    clientPort: 8081
+    mtlsPort: 8443
+
+web:
+  standalone:
+    enabled: false
+    replicaCount: 1
+    image: backplane-enterprise-web
+    port: 8080
+
+migrate:
+  enabled: true
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+
+# Security requirement:
+# - databaseAppUrl connects as unprivileged `bp_app` (NOBYPASSRLS) -> mounted into runtime pods ONLY.
+# - databaseAdminUrl + databaseAppPassword -> mounted into the migrate Job ONLY.
+# - bpKek MUST follow `<id>:<32-byte-base64>` (e.g. `v1:$(openssl rand -base64 32)`).
+# - boatCaCertPem / boatCaKeyPem MUST be populated (or provided via existingSecret) so replicas share one Boat CA.
+secrets:
+  existingSecret: ""
+  databaseAppUrl: "postgres://bp_app:CHANGE_ME@postgres:5432/backplane_enterprise?sslmode=require"
+  databaseAdminUrl: "postgres://bp_admin:CHANGE_ME@postgres:5432/backplane_enterprise?sslmode=require"
+  databaseAppPassword: "CHANGE_ME"
+  bpKek: "v1:REPLACE_WITH_32_BYTE_BASE64_KEY"
+  boatCaCertPem: ""
+  boatCaKeyPem: ""
+  s3AccessKey: ""
+  s3SecretKey: ""
+  stripeSecretKey: ""
+  stripeWebhookSecret: ""
+  googleMailClientSecret: ""
+  microsoftMailClientSecret: ""
+
+s3:
+  endpoint: ""
+  region: "us-east-1"
+  bucket: "bp-ent-artifacts"
+
+kms:
+  provider: "local" # "local" | "aws"
+  keyId: ""
+
+billing:
+  stripeSeatPriceId: ""
+  stripeVmPriceId: ""
+  stripeVmMeterEvent: "boat_vm_minutes"
+
+mail:
+  googleClientId: ""
+  microsoftClientId: ""
+  microsoftTenant: "common"
+  sesRegion: ""
+  sesFrom: ""
+
+ingress:
+  enabled: true
+  className: "nginx"
+  host: "enterprise.example.com"
+  tlsSecretName: "backplane-enterprise-tls"
+  annotations: {}
+
+networkPolicy:
+  enabled: true
+  ingressNamespace: "ingress-nginx"
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

@@ -1,0 +1,48 @@
+#cloud-config
+# Backplane Enterprise Managed Boat VM Bootstrap
+# Security posture:
+# - Zero Tailscale, zero inbound open ports, SSH disabled.
+# - Provisions a <=24h X.509 mTLS device certificate with SPIFFE SAN URI
+#   spiffe://backplane.enterprise/tenant/<tenant_id>/vm/<vm_id>.
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/backplane-boat/config.env
+    owner: root:boat
+    permissions: "0640"
+    content: |
+      RELAY_MTLS_URL=${relay_mtls_url}
+      RELAY_API_URL=${relay_api_url}
+      TENANT_ID=${tenant_id}
+      VM_ID=${vm_id}
+      CERT_DIR=/etc/backplane-boat/certs
+      BACKPLANE_IPC_SOCK=/run/backplane-boat/hub.sock
+      KICAD_IPC_SOCK=/run/backplane-boat/kicad.sock
+      HEARTBEAT_INTERVAL_SECS=30
+
+  - path: /etc/backplane-boat/certs/ca.pem
+    owner: boat:boat
+    permissions: "0644"
+    content: |
+      ${boat_ca_cert_pem_indented}
+
+  - path: /etc/backplane-boat/certs/device.crt
+    owner: boat:boat
+    permissions: "0640"
+    content: |
+      ${device_cert_pem_indented}
+
+  - path: /etc/backplane-boat/certs/device.key
+    owner: boat:boat
+    permissions: "0600"
+    content: |
+      ${device_key_pem_indented}
+
+runcmd:
+  - [chmod, "0600", /etc/backplane-boat/certs/device.key]
+  - [chown, -R, "boat:boat", /etc/backplane-boat/certs]
+  - [systemctl, daemon-reload]
+  - [systemctl, restart, bp-boat-relay-agent.service]
+  - [systemctl, enable, --now, bp-boat-cert-renew.timer]

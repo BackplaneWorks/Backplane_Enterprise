@@ -1,0 +1,55 @@
+# cargo-deny policy for Backplane Enterprise. Run: `cargo deny check`.
+# Enforced in CI by .github/workflows/security.yml.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Every RustSec advisory fails the build. Add an entry to `ignore` only with a
+# written reason and an expiry date in the comment beside it.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses compatible with shipping an MIT product. No copyleft.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",   # file-level copyleft only (webpki-roots); unmodified use is fine
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # TLS goes through rustls so there is one audited TLS stack and no
+    # system OpenSSL in the containers.
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+    # Unmaintained or superseded crypto.
+    { crate = "md5", use-instead = "sha2" },
+    { crate = "sha1", wrappers = ["tungstenite", "sqlx-postgres", "sqlx-mysql", "sqlx-core"] },
+    { crate = "rust-crypto", use-instead = "RustCrypto crates (aes-gcm, sha2, hmac)" },
+    { crate = "time", version = "<0.3.36" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

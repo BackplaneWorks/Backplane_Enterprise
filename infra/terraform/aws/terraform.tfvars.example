@@ -1,0 +1,20 @@
+aws_region          = "us-east-1"
+environment         = "prod"
+name_prefix         = "bp-ent"
+portal_domain       = "enterprise.example.com"
+relay_mtls_domain   = "relay.enterprise.example.com"
+acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/replace-me"
+ses_domain          = "enterprise.example.com"
+
+# Single unified ARM64 Graviton image (`bp-ent-api serve` with embedded /app/web)
+app_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/bp-ent-api:0.1.0"
+
+# Lean baseline defaults (<$1-$2/user/month COGS):
+ecs_desired_count            = 1
+ecs_task_cpu                 = "256"
+ecs_task_memory              = "512"
+db_instance_class            = "db.t4g.micro"
+db_multi_az                  = false
+enable_boat_mtls_nlb         = true
+enable_managed_waf_rules     = false
+boat_relay_idle_timeout_secs = 900

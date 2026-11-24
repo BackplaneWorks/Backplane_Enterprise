@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-config
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+data:
+  BP_PUBLIC_ORIGIN: {{ .Values.global.publicOrigin | quote }}
+  BP_API_BASE_URL: {{ .Values.global.apiBaseUrl | quote }}
+  BP_INSECURE_COOKIES: {{ .Values.global.insecureCookies | quote }}
+  BP_TRUSTED_PROXY_HOPS: {{ .Values.global.trustedProxyHops | quote }}
+  BP_WEB_DIR: "/app/web"
+  RUST_LOG: {{ .Values.global.rustLog | quote }}
+  S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  S3_REGION: {{ .Values.s3.region | quote }}
+  S3_BUCKET: {{ .Values.s3.bucket | quote }}
+  BP_KMS_PROVIDER: {{ .Values.kms.provider | quote }}
+  BP_KMS_KEY_ID: {{ .Values.kms.keyId | quote }}
+  BP_RELAY_DISABLED: {{ ternary "0" "1" .Values.relay.enabled | quote }}
+  BP_RELAY_MTLS_ADDR: "0.0.0.0:{{ .Values.api.mtlsPort }}"
+  BP_RELAY_MTLS_HOST: {{ .Values.relay.mtlsHost | quote }}
+  BP_RELAY_IDLE_TIMEOUT_SECS: {{ .Values.relay.idleTimeoutSecs | quote }}
+  STRIPE_SEAT_PRICE_ID: {{ .Values.billing.stripeSeatPriceId | quote }}
+  STRIPE_VM_PRICE_ID: {{ .Values.billing.stripeVmPriceId | quote }}
+  STRIPE_VM_METER_EVENT: {{ .Values.billing.stripeVmMeterEvent | quote }}
+  GOOGLE_MAIL_CLIENT_ID: {{ .Values.mail.googleClientId | quote }}
+  MICROSOFT_MAIL_CLIENT_ID: {{ .Values.mail.microsoftClientId | quote }}
+  MICROSOFT_MAIL_TENANT: {{ .Values.mail.microsoftTenant | quote }}
+  BP_SES_REGION: {{ .Values.mail.sesRegion | quote }}
+  BP_SES_FROM: {{ .Values.mail.sesFrom | quote }}

@@ -1,0 +1,15 @@
+apiVersion: v2
+name: backplane-enterprise
+description: Self-hostable & VPC Kubernetes deployment for Backplane Enterprise (API, Zero-Tailscale Boat Relay, Web Portal, Migration Job)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/BackplaneWorks/Backplane_Enterprise
+sources:
+  - https://github.com/BackplaneWorks/Backplane_Enterprise
+keywords:
+  - backplane
+  - kicad
+  - hardware
+  - enterprise
+  - mtls

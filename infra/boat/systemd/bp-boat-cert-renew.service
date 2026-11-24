@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew Backplane Enterprise Boat <=24h mTLS Device Certificate
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=boat
+Group=boat
+EnvironmentFile=-/etc/backplane-boat/config.env
+ExecStart=/usr/local/bin/boat-relay-agent renew
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/etc/backplane-boat/certs

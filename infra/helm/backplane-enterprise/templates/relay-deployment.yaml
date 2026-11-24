@@ -1,0 +1,73 @@
+{{- if .Values.relay.standalone.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-relay
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+spec:
+  replicas: {{ .Values.relay.standalone.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: relay
+  template:
+    metadata:
+      labels:
+        {{- include "bp-ent.labels" . | nindent 8 }}
+        app.kubernetes.io/component: relay
+    spec:
+      serviceAccountName: {{ include "bp-ent.fullname" . }}-runtime
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: relay
+          image: "{{ .Values.image.registry }}/{{ .Values.relay.standalone.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: client-wss
+              containerPort: {{ .Values.relay.standalone.clientPort }}
+            - name: boat-mtls
+              containerPort: {{ .Values.relay.standalone.mtlsPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "bp-ent.fullname" . }}-config
+          env:
+            - name: BP_RELAY_CLIENT_ADDR
+              value: "0.0.0.0:{{ .Values.relay.standalone.clientPort }}"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: databaseAppUrl
+            - name: BP_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: bpKek
+            - name: BP_BOAT_CA_CERT_FILE
+              value: "/etc/backplane-boat-ca/ca.crt"
+            - name: BP_BOAT_CA_KEY_FILE
+              value: "/etc/backplane-boat-ca/ca.key"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: boat-ca
+              mountPath: /etc/backplane-boat-ca
+              readOnly: true
+      volumes:
+        - name: boat-ca
+          secret:
+            secretName: {{ include "bp-ent.secretName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+              - key: ca.key
+                path: ca.key
+{{- end }}

@@ -1,0 +1,24 @@
+[package]
+name = "bp-ent-codev"
+description = "Backplane Enterprise board co-development: projects, revisions, snapshots, pinned review comments, BOM and revision diffs, ECOs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bp-ent-core.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+bp-ent-core = { workspace = true, features = ["testkit"] }
+tokio.workspace = true
+tower.workspace = true
+http-body-util = "0.1"

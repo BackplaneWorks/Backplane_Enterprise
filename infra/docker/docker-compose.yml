@@ -1,0 +1,182 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-backplane_enterprise}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-bp_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
+      BP_APP_DB_USER: ${BP_APP_DB_USER:-bp_app}
+      BP_APP_DB_PASSWORD: ${BP_APP_DB_PASSWORD:?set BP_APP_DB_PASSWORD in .env}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init-roles.sh:/docker-entrypoint-initdb.d/01-init-roles.sh:ro
+    networks:
+      - bp_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-bp_admin} -d ${POSTGRES_DB:-backplane_enterprise}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-18T16-25-55Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-bpminio_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - minio_data:/data
+    networks:
+      - bp_internal
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Provisions the private bucket AND a bucket-scoped service account (not root creds) for `app`.
+  minio-init:
+    image: minio/mc:RELEASE.2025-02-15T10-36-16Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-bpminio_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      S3_BUCKET: ${S3_BUCKET:-bp-ent-artifacts}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+        mc anonymous set none "local/$${S3_BUCKET}"
+        cat > /tmp/bp-app-s3.json <<EOF
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::$${S3_BUCKET}/tenants/*"]},{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::$${S3_BUCKET}"],"Condition":{"StringLike":{"s3:prefix":["tenants/*"]}}}]}
+        EOF
+        mc admin user add local bp_app_s3 "$${S3_SECRET_KEY}" || true
+        mc admin policy create local bp-app-bucket /tmp/bp-app-s3.json || true
+        mc admin policy attach local bp-app-bucket --user bp_app_s3 || true
+        mc admin user svcacct add local bp_app_s3 --access-key "$${S3_ACCESS_KEY}" --secret-key "$${S3_SECRET_KEY}" --policy /tmp/bp-app-s3.json || true
+    networks:
+      - bp_internal
+
+  # Generates a persistent Boat CA keypair in the shared volume if not yet present.
+  boat-ca-init:
+    image: alpine:3.21
+    restart: "no"
+    volumes:
+      - boat_ca:/etc/backplane-boat-ca
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        apk add --no-cache openssl >/dev/null
+        if [ ! -f /etc/backplane-boat-ca/ca.crt ] || [ ! -f /etc/backplane-boat-ca/ca.key ]; then
+          openssl ecparam -name prime256v1 -genkey -noout -out /etc/backplane-boat-ca/ca.key
+          openssl req -new -x509 -sha256 -days 3650 \
+            -key /etc/backplane-boat-ca/ca.key \
+            -subj "/O=Backplane Enterprise/CN=Backplane Boat Device CA" \
+            -out /etc/backplane-boat-ca/ca.crt
+          chmod 0644 /etc/backplane-boat-ca/ca.crt
+          chmod 0640 /etc/backplane-boat-ca/ca.key
+        fi
+        chown -R 10001:10001 /etc/backplane-boat-ca
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.backend
+      args:
+        BIN: bp-ent-api
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["migrate"]
+    environment:
+      # ONLY the one-shot migrate container receives DATABASE_ADMIN_URL + BP_APP_DB_PASSWORD.
+      DATABASE_ADMIN_URL: postgres://${POSTGRES_ADMIN_USER:-bp_admin}:${POSTGRES_ADMIN_PASSWORD}@postgres:5432/${POSTGRES_DB:-backplane_enterprise}
+      BP_APP_DB_PASSWORD: ${BP_APP_DB_PASSWORD}
+      RUST_LOG: ${RUST_LOG:-info}
+    networks:
+      - bp_internal
+
+  # Unified single-binary Backplane Enterprise server (`bp-ent-api serve`):
+  # serves Web Portal (BP_WEB_DIR=/app/web), API, WebSocket relay, and Boat mTLS (:8443).
+  app:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.backend
+      args:
+        BIN: bp-ent-api
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      boat-ca-init:
+        condition: service_completed_successfully
+    command: ["serve"]
+    environment:
+      # Connects strictly as non-owner, NOBYPASSRLS role bp_app.
+      DATABASE_URL: postgres://${BP_APP_DB_USER:-bp_app}:${BP_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-backplane_enterprise}
+      BP_BIND: 0.0.0.0:8080
+      BP_WEB_DIR: /app/web
+      BP_PUBLIC_ORIGIN: ${BP_PUBLIC_ORIGIN:-http://localhost:8080}
+      BP_API_BASE_URL: ${BP_API_BASE_URL:-http://localhost:8080}
+      BP_INSECURE_COOKIES: ${BP_INSECURE_COOKIES:-1}
+      BP_TRUSTED_PROXY_HOPS: ${BP_TRUSTED_PROXY_HOPS:-0}
+      BP_KMS_PROVIDER: local
+      BP_KEK: ${BP_KEK:?set BP_KEK=<id>:<32-byte-base64> in .env}
+      BP_BOAT_CA_CERT_FILE: /etc/backplane-boat-ca/ca.crt
+      BP_BOAT_CA_KEY_FILE: /etc/backplane-boat-ca/ca.key
+      BP_RELAY_MTLS_ADDR: 0.0.0.0:8443
+      BP_RELAY_MTLS_HOST: ${BP_RELAY_MTLS_HOST:-localhost}
+      BP_RELAY_IDLE_TIMEOUT_SECS: ${BP_RELAY_IDLE_TIMEOUT_SECS:-900}
+      BP_RELAY_DISABLED: ${BP_RELAY_DISABLED:-0}
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-bp-ent-artifacts}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_SEAT_PRICE_ID: ${STRIPE_SEAT_PRICE_ID:-}
+      STRIPE_VM_PRICE_ID: ${STRIPE_VM_PRICE_ID:-}
+      STRIPE_VM_METER_EVENT: ${STRIPE_VM_METER_EVENT:-boat_vm_minutes}
+      GOOGLE_MAIL_CLIENT_ID: ${GOOGLE_MAIL_CLIENT_ID:-}
+      GOOGLE_MAIL_CLIENT_SECRET: ${GOOGLE_MAIL_CLIENT_SECRET:-}
+      MICROSOFT_MAIL_CLIENT_ID: ${MICROSOFT_MAIL_CLIENT_ID:-}
+      MICROSOFT_MAIL_CLIENT_SECRET: ${MICROSOFT_MAIL_CLIENT_SECRET:-}
+      MICROSOFT_MAIL_TENANT: ${MICROSOFT_MAIL_TENANT:-common}
+      BP_SES_REGION: ${BP_SES_REGION:-}
+      BP_SES_FROM: ${BP_SES_FROM:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - boat_ca:/etc/backplane-boat-ca:ro
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+      - "${RELAY_MTLS_PORT:-8443}:8443"
+    networks:
+      - bp_internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  pg_data:
+  minio_data:
+  boat_ca:
+
+networks:
+  bp_internal:
+    driver: bridge

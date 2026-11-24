@@ -1,0 +1,42 @@
+[
+ {
+  "xml": "<a:root xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" xmlns:unused=\"urn:u\"><b:x ID=\"t\" b:attr=\"1\" z=\"2\" a:attr=\"3\" xml:lang=\"en\">  text &amp; &lt;more&gt; <a:y/><c xmlns=\"urn:d\"><d xmlns=\"\"/></c></b:x></a:root>",
+  "id": "t",
+  "inclusive": [],
+  "expected": "<b:x xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" ID=\"t\" z=\"2\" xml:lang=\"en\" a:attr=\"3\" b:attr=\"1\">  text &amp; &lt;more&gt; <a:y></a:y><c xmlns=\"urn:d\"><d xmlns=\"\"></d></c></b:x>"
+ },
+ {
+  "xml": "<root xmlns=\"urn:def\" xmlns:p=\"urn:p\"><x ID=\"t\" p:b=\"2\" a=\"1\"><y xmlns=\"\"><z xmlns=\"urn:def\"/></y><!-- c --><p:q/>tail</x></root>",
+  "id": "t",
+  "inclusive": [],
+  "expected": "<x xmlns=\"urn:def\" xmlns:p=\"urn:p\" ID=\"t\" a=\"1\" p:b=\"2\"><y xmlns=\"\"><z xmlns=\"urn:def\"></z></y><p:q></p:q>tail</x>"
+ },
+ {
+  "xml": "<r xmlns:xs=\"urn:xs\" xmlns:xsi=\"urn:xsi\" xmlns:n=\"urn:n\"><n:e ID=\"t\"><n:v xsi:type=\"xs:string\">v</n:v></n:e></r>",
+  "id": "t",
+  "inclusive": [
+   "xs"
+  ],
+  "expected": "<n:e xmlns:n=\"urn:n\" xmlns:xs=\"urn:xs\" ID=\"t\"><n:v xmlns:xsi=\"urn:xsi\" xsi:type=\"xs:string\">v</n:v></n:e>"
+ },
+ {
+  "xml": "<r xmlns:n=\"urn:n\" xmlns:m=\"urn:n\"><n:e ID=\"t\"><m:f n:a=\"1\" m:b=\"2\"/></n:e></r>",
+  "id": "t",
+  "inclusive": [],
+  "expected": "<n:e xmlns:n=\"urn:n\" ID=\"t\"><m:f xmlns:m=\"urn:n\" n:a=\"1\" m:b=\"2\"></m:f></n:e>"
+ },
+ {
+  "xml": "<r><e ID=\"t\" a=\"x&#10;y&#9;z &quot;q&quot; &lt; &amp;\">line1&#13;\nline2 &gt; ]]&gt;</e></r>",
+  "id": "t",
+  "inclusive": [],
+  "expected": "<e ID=\"t\" a=\"x&#xA;y&#x9;z &quot;q&quot; &lt; &amp;\">line1&#xD;\nline2 &gt; ]]&gt;</e>"
+ },
+ {
+  "xml": "<r xmlns=\"urn:def\"><e ID=\"t\" xmlns:k=\"urn:k\"><k:c xmlns:k=\"urn:k2\"><k:d/></k:c><k:c/></e></r>",
+  "id": "t",
+  "inclusive": [
+   "k"
+  ],
+  "expected": "<e xmlns=\"urn:def\" xmlns:k=\"urn:k\" ID=\"t\"><k:c xmlns:k=\"urn:k2\"><k:d></k:d></k:c><k:c></k:c></e>"
+ }
+]

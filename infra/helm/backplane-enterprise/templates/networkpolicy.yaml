@@ -1,0 +1,42 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-default-deny-ingress
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-allow-api
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.port }}
+    {{- if .Values.relay.enabled }}
+    # Boat VM outbound mTLS listener (port 8443): verified by TLS 1.3 WebPkiClientVerifier.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.api.mtlsPort }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,31 @@
+[Unit]
+Description=Backplane Enterprise Boat Outbound mTLS Relay Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=boat
+Group=boat
+EnvironmentFile=-/etc/backplane-boat/config.env
+ExecStart=/usr/local/bin/boat-relay-agent run
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/run/backplane-boat /var/lib/backplane/workspace
+ReadOnlyPaths=/etc/backplane-boat
+
+[Install]
+WantedBy=multi-user.target

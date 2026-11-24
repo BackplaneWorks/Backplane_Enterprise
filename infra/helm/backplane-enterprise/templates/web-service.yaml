@@ -1,0 +1,18 @@
+{{- if .Values.web.standalone.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-web
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.web.standalone.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: web
+{{- end }}

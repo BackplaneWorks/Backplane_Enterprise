@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-api
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "bp-ent.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: {{ include "bp-ent.fullname" . }}-runtime
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: api
+          image: "{{ .Values.image.registry }}/{{ .Values.api.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+            {{- if .Values.relay.enabled }}
+            - name: boat-mtls
+              containerPort: {{ .Values.api.mtlsPort }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "bp-ent.fullname" . }}-config
+          env:
+            - name: BP_BIND
+              value: "0.0.0.0:{{ .Values.api.port }}"
+            # Runtime service uses ONLY DATABASE_URL (bp_app, NOBYPASSRLS).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: databaseAppUrl
+            - name: BP_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: bpKek
+            - name: BP_BOAT_CA_CERT_FILE
+              value: "/etc/backplane-boat-ca/ca.crt"
+            - name: BP_BOAT_CA_KEY_FILE
+              value: "/etc/backplane-boat-ca/ca.key"
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: s3AccessKey
+                  optional: true
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: s3SecretKey
+                  optional: true
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: stripeSecretKey
+                  optional: true
+            - name: STRIPE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: stripeWebhookSecret
+                  optional: true
+            - name: GOOGLE_MAIL_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: googleMailClientSecret
+                  optional: true
+            - name: MICROSOFT_MAIL_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bp-ent.secretName" . }}
+                  key: microsoftMailClientSecret
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: boat-ca
+              mountPath: /etc/backplane-boat-ca
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: boat-ca
+          secret:
+            secretName: {{ include "bp-ent.secretName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+              - key: ca.key
+                path: ca.key

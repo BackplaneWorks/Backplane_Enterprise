@@ -1,0 +1,22 @@
+[package]
+name = "bp-ent-sectest"
+description = "Backplane Enterprise security regression suite: cross-tenant isolation, RLS catalog audit, crypto and auth boundary tests across all crates."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+bp-ent-core = { path = "../bp-ent-core", features = ["testkit"] }
+http.workspace = true
+serde_json.workspace = true
+bp-ent-orders = { path = "../bp-ent-orders" }
+bp-ent-relay = { path = "../bp-ent-relay" }
+rustls-pemfile = "2"
+time.workspace = true

@@ -1,0 +1,51 @@
+[package]
+name = "bp-ent-api"
+description = "Backplane Enterprise API server: SSO, sessions, admin governance, and the single binary that serves every service router."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["httplib", "orders", "relay", "bridges", "codev"]
+# AWS KMS key provider (build the production image with this).
+aws-kms = ["bp-ent-core/aws-kms"]
+httplib = ["dep:bp-ent-httplib"]
+orders = ["dep:bp-ent-orders"]
+relay = ["dep:bp-ent-relay"]
+bridges = ["dep:bp-ent-bridges"]
+codev = ["dep:bp-ent-codev"]
+
+[dependencies]
+bp-ent-core.workspace = true
+bp-ent-httplib = { path = "../bp-ent-httplib", optional = true }
+bp-ent-orders = { path = "../bp-ent-orders", optional = true }
+bp-ent-relay = { path = "../bp-ent-relay", optional = true }
+bp-ent-bridges = { path = "../bp-ent-bridges", optional = true }
+bp-ent-codev = { path = "../bp-ent-codev", optional = true }
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+flate2 = "1"
+http.workspace = true
+jsonwebtoken.workspace = true
+ring = "0.17"
+roxmltree = "0.20"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+x509-parser = "0.16"
+
+[dev-dependencies]
+bp-ent-core = { workspace = true, features = ["testkit"] }
+http-body-util = "0.1"

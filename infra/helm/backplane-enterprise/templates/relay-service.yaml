@@ -1,0 +1,18 @@
+{{- if .Values.relay.standalone.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bp-ent.fullname" . }}-relay-client
+  labels:
+    {{- include "bp-ent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+spec:
+  type: ClusterIP
+  ports:
+    - name: client-wss
+      port: {{ .Values.relay.standalone.clientPort }}
+      targetPort: client-wss
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: relay
+{{- end }}
