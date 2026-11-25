@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod ca;
 pub mod lifecycle;
 pub mod mtls_server;

@@ -138,9 +138,14 @@ services:
       BP_BOAT_CA_CERT_FILE: /etc/backplane-boat-ca/ca.crt
       BP_BOAT_CA_KEY_FILE: /etc/backplane-boat-ca/ca.key
       BP_RELAY_MTLS_ADDR: 0.0.0.0:8443
-      BP_RELAY_MTLS_HOST: ${BP_RELAY_MTLS_HOST:-localhost}
+      BP_RELAY_MTLS_HOST: ${BP_RELAY_MTLS_HOST:-app,localhost}
       BP_RELAY_IDLE_TIMEOUT_SECS: ${BP_RELAY_IDLE_TIMEOUT_SECS:-900}
       BP_RELAY_DISABLED: ${BP_RELAY_DISABLED:-0}
+      BP_APNS_KEY_FILE: ${BP_APNS_KEY_FILE:-}
+      BP_APNS_KEY_ID: ${BP_APNS_KEY_ID:-}
+      BP_APNS_TEAM_ID: ${BP_APNS_TEAM_ID:-}
+      BP_APNS_MOCK_URL: ${BP_APNS_MOCK_URL:-}
+      BP_PUSH_RATE_PER_MINUTE: ${BP_PUSH_RATE_PER_MINUTE:-60}
       S3_ENDPOINT: http://minio:9000
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_BUCKET: ${S3_BUCKET:-bp-ent-artifacts}
@@ -159,11 +164,13 @@ services:
       BP_SES_REGION: ${BP_SES_REGION:-}
       BP_SES_FROM: ${BP_SES_FROM:-}
       RUST_LOG: ${RUST_LOG:-info}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - boat_ca:/etc/backplane-boat-ca:ro
     ports:
-      - "${WEB_PORT:-8080}:8080"
-      - "${RELAY_MTLS_PORT:-8443}:8443"
+      - "${BIND_HOST:-127.0.0.1}:${WEB_PORT:-8080}:8080"
+      - "${BIND_HOST:-127.0.0.1}:${RELAY_MTLS_PORT:-8493}:8443"
     networks:
       - bp_internal
     healthcheck:

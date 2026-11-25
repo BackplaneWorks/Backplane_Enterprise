@@ -44,6 +44,10 @@ USAGE
         [--issuer <https://...>] [--domain <example.com>]... [--auto-provision]
       Configure the org's first sign-in provider (later ones: admin console).
 
+  bp-ent-api token issue --slug <slug> --email <email> --name <name>
+        [--ttl-days <1..366>] [--activate]
+      Issue an API token for a member (e.g. desktop relay bridge or Boat hub).
+
   bp-ent-api keys rewrap
       After rotating the master key (BP_KEK / BP_KMS_KEY_ID), re-wrap every
       tenant's data keys under the new one.
@@ -100,6 +104,7 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         ["tenant", "create", rest @ ..] => tenant_create(&parse_flags(&to_owned(rest))?).await,
         ["tenant", "add-domain", rest @ ..] => tenant_add_domain(&parse_flags(&to_owned(rest))?).await,
         ["idp", "add", rest @ ..] => idp_add(&parse_flags(&to_owned(rest))?).await,
+        ["token", "issue", rest @ ..] => token_issue(&parse_flags(&to_owned(rest))?).await,
         ["keys", "rewrap"] => keys_rewrap().await,
         ["audit", "verify", rest @ ..] => audit_verify(&parse_flags(&to_owned(rest))?).await,
         ["help"] | ["--help"] | ["-h"] => {
@@ -219,6 +224,74 @@ async fn idp_add(f: &HashMap<String, Vec<String>>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn token_issue(f: &HashMap<String, Vec<String>>) -> anyhow::Result<()> {
+    use bp_ent_core::{audit, auth, rbac::Scopes, AuthKind, UserId};
+    use sqlx::Row;
+    let slug = one(f, "slug")?;
+    let email = bp_ent_api::routes::sso::normalize_email(one(f, "email")?)
+        .map_err(|_| anyhow::anyhow!("invalid --email"))?;
+    let name = one(f, "name")?;
+    let ttl_days: u64 = match f.get("ttl-days").and_then(|v| v.first()) {
+        Some(s) => s.parse().context("--ttl-days must be an integer")?,
+        None => 90,
+    };
+    if !(1..=366).contains(&ttl_days) {
+        bail!("--ttl-days must be between 1 and 366");
+    }
+    let activate = f.contains_key("activate");
+    let ctx = AppCtx::from_env().await?;
+    let tenant = ctx
+        .db
+        .tenant_by_slug(slug)
+        .await?
+        .with_context(|| format!("no organisation with slug {slug}"))?;
+    let mut tx = ctx.db.tenant_tx(tenant).await?;
+    let row = sqlx::query("SELECT id, status FROM users WHERE tenant_id = $1 AND email = $2 FOR UPDATE")
+        .bind(tenant.0)
+        .bind(&email)
+        .fetch_optional(&mut *tx)
+        .await?
+        .with_context(|| format!("no user {email} in {slug}"))?;
+    let user_id = UserId(row.get("id"));
+    let status: String = row.get("status");
+    if status == "suspended" {
+        bail!("user {email} is suspended");
+    }
+    if status == "invited" {
+        if !activate {
+            bail!("user {email} is invited (pass --activate to activate them)");
+        }
+        sqlx::query("UPDATE users SET status = 'active' WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.0)
+            .bind(user_id.0)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let ttl = std::time::Duration::from_secs(ttl_days * 86_400);
+    let (token_id, token) = auth::issue_token(
+        &mut tx,
+        tenant,
+        user_id,
+        AuthKind::UserToken,
+        name,
+        &Scopes::All,
+        ttl,
+    )
+    .await?;
+    audit::append_system(
+        &mut tx,
+        tenant,
+        "operator-cli",
+        "token.issued",
+        &format!("token:{token_id}"),
+        serde_json::json!({ "user": user_id, "name": name, "ttlDays": ttl_days }),
+    )
+    .await?;
+    tx.commit().await?;
+    println!("{}", token.expose());
+    Ok(())
+}
+
 async fn keys_rewrap() -> anyhow::Result<()> {
     let ctx = AppCtx::from_env().await?;
     let mut total = 0;
@@ -307,6 +380,9 @@ async fn mounts(ctx: &AppCtx) -> anyhow::Result<Mounts> {
     #[cfg(feature = "codev")]
     m.routers.push(bp_ent_codev::router(ctx.clone()));
 
+    #[cfg(feature = "push")]
+    m.routers.push(bp_ent_push::router(ctx.clone()));
+
     #[cfg(feature = "orders")]
     let orders = {
         let svc = bp_ent_orders::Svc::new(ctx.clone(), bp_ent_orders::OrdersConfig::from_env());
@@ -343,8 +419,14 @@ async fn mounts(ctx: &AppCtx) -> anyhow::Result<Mounts> {
 
         // Boat VMs dial in over mutual TLS on their own port.
         let mtls_addr: SocketAddr = bp_ent_core::config::env_parse("BP_RELAY_MTLS_ADDR", SocketAddr::from(([0, 0, 0, 0], 8443)))?;
-        let mtls_host = std::env::var("BP_RELAY_MTLS_HOST").unwrap_or_else(|_| "localhost".into());
-        let server = MtlsRelayServer::new(&state.ca, &[mtls_host.as_str()], relay_router.clone())?;
+        let mtls_host_raw = std::env::var("BP_RELAY_MTLS_HOST").unwrap_or_else(|_| "localhost".into());
+        let mtls_hosts: Vec<&str> = mtls_host_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mtls_hosts = if mtls_hosts.is_empty() { vec!["localhost"] } else { mtls_hosts };
+        let server = MtlsRelayServer::new(&state.ca, &mtls_hosts, relay_router.clone())?;
         let listener = tokio::net::TcpListener::bind(mtls_addr).await.with_context(|| format!("cannot bind relay mTLS port {mtls_addr}"))?;
         tracing::info!(%mtls_addr, "Boat VM mTLS relay listening");
         tokio::spawn(async move {

@@ -16,8 +16,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release --locked --bin "${BIN}" --features "${FEATURES}" \
-    && cp "/app/target/release/${BIN}" /usr/local/bin/bp-service
+RUN cargo build --release --locked --bin "${BIN}" --bin bp-ent-relay --features "${FEATURES}" \
+    && cp "/app/target/release/${BIN}" /usr/local/bin/bp-service \
+    && cp /app/target/release/bp-ent-relay /usr/local/bin/bp-ent-relay
 
 FROM debian:bookworm-slim AS runtime
 
@@ -28,6 +29,7 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --shell /usr/sbin/nologin --create-home bp
 
 COPY --from=builder /usr/local/bin/bp-service /usr/local/bin/bp-service
+COPY --from=builder /usr/local/bin/bp-ent-relay /usr/local/bin/bp-ent-relay
 COPY --from=web-builder /app/web/dist /app/web
 
 USER bp:bp

@@ -43,6 +43,8 @@ pub fn migrators() -> Vec<Migrator> {
     v.push(bp_ent_bridges::migrator());
     #[cfg(feature = "codev")]
     v.push(bp_ent_codev::migrator());
+    #[cfg(feature = "push")]
+    v.push(bp_ent_push::migrator());
     v
 }
 

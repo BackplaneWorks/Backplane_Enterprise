@@ -1,16 +1,20 @@
-//! Standalone `bp-ent-relay` binary:
-//! - Client API + Desktop WSS listener (`BP_RELAY_CLIENT_ADDR`, default `0.0.0.0:8081`)
-//! - Boat VM outbound TLS 1.3 mTLS listener (`BP_RELAY_MTLS_ADDR`, default `0.0.0.0:8443`)
-//! - Background idle-VM reaper emitting Stripe `UsageRecord`s
+//! Standalone `bp-ent-relay` binary and bridge agents:
+//! - Server mode (default): client WSS + Boat VM mTLS listener + idle-VM reaper
+//! - `boat-agent`: outbound TLS 1.3 mTLS bridge running inside a Boat VM/container
+//! - `desktop-bridge`: outbound authenticated WSS bridge running on the Desktop
 
 #![forbid(unsafe_code)]
 
+use anyhow::{bail, Context};
 use bp_ent_core::{config::env_parse, AppCtx};
-use bp_ent_relay::{reap_idle_vms, router_with_state, MtlsRelayServer, RelayConfig, RelayState};
+use bp_ent_relay::{bridge, reap_idle_vms, router_with_state, MtlsRelayServer, RelayConfig, RelayState};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,6 +22,48 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .json()
         .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("boat-agent") => {
+            let f = parse_flags(&args[1..])?;
+            let relay_url = one(&f, "relay-url")?.to_string();
+            let ca_cert = PathBuf::from(one(&f, "ca-cert")?);
+            let client_cert = PathBuf::from(one(&f, "client-cert")?);
+            let client_key = PathBuf::from(one(&f, "client-key")?);
+            let local_hub = one(&f, "local-hub")?.to_string();
+            let peer_listen: SocketAddr = one(&f, "peer-listen")?.parse().context("invalid --peer-listen")?;
+            return bridge::run_boat_agent(
+                relay_url,
+                ca_cert,
+                client_cert,
+                client_key,
+                local_hub,
+                peer_listen,
+            )
+            .await;
+        }
+        Some("desktop-bridge") => {
+            let f = parse_flags(&args[1..])?;
+            let api_url = one(&f, "api-url")?.to_string();
+            let vm_id = Uuid::parse_str(one(&f, "vm-id")?).context("invalid --vm-id")?;
+            let token_file = PathBuf::from(one(&f, "token-file")?);
+            let ca_cert = f.get("ca-cert").filter(|v| !v.is_empty()).map(PathBuf::from);
+            let local_hub = one(&f, "local-hub")?.to_string();
+            let peer_listen: SocketAddr = one(&f, "peer-listen")?.parse().context("invalid --peer-listen")?;
+            return bridge::run_desktop_bridge(
+                api_url,
+                vm_id,
+                token_file,
+                ca_cert,
+                local_hub,
+                peer_listen,
+            )
+            .await;
+        }
+        Some("serve") | None => {}
+        Some(other) => bail!("unknown subcommand {other:?} (expected serve | boat-agent | desktop-bridge)"),
+    }
 
     let ctx = AppCtx::from_env().await?;
     let mut state = RelayState::from_ctx(ctx)?;
@@ -33,10 +79,16 @@ async fn main() -> anyhow::Result<()> {
     let mtls_addr: SocketAddr = std::env::var("BP_RELAY_MTLS_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
         .parse()?;
-    let mtls_host = std::env::var("BP_RELAY_MTLS_HOST").unwrap_or_else(|_| "localhost".into());
+    let mtls_host_raw = std::env::var("BP_RELAY_MTLS_HOST").unwrap_or_else(|_| "localhost".into());
+    let mtls_hosts: Vec<&str> = mtls_host_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mtls_hosts = if mtls_hosts.is_empty() { vec!["localhost"] } else { mtls_hosts };
 
     let app = router_with_state(state.clone());
-    let mtls_server = MtlsRelayServer::new(&state.ca, &[mtls_host.as_str()], app.clone())?;
+    let mtls_server = MtlsRelayServer::new(&state.ca, &mtls_hosts, app.clone())?;
 
     let client_listener = TcpListener::bind(client_addr).await?;
     let mtls_listener = TcpListener::bind(mtls_addr).await?;
@@ -70,4 +122,27 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+fn parse_flags(args: &[String]) -> anyhow::Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i]
+            .strip_prefix("--")
+            .with_context(|| format!("unexpected argument {:?}", args[i]))?;
+        let val = args
+            .get(i + 1)
+            .with_context(|| format!("--{key} requires a value"))?;
+        out.insert(key.to_string(), val.clone());
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn one<'a>(f: &'a HashMap<String, String>, key: &str) -> anyhow::Result<&'a str> {
+    f.get(key)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("--{key} is required"))
 }

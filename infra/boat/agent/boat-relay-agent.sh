@@ -17,7 +17,8 @@ CERT_DIR="${CERT_DIR:-/etc/backplane-boat/certs}"
 CA_CERT="${CERT_DIR}/ca.pem"
 DEVICE_CERT="${CERT_DIR}/device.crt"
 DEVICE_KEY="${CERT_DIR}/device.key"
-BACKPLANE_IPC_SOCK="${BACKPLANE_IPC_SOCK:-/run/backplane-boat/hub.sock}"
+LOCAL_HUB_URL="${LOCAL_HUB_URL:-http://127.0.0.1:3798}"
+PEER_LISTEN_ADDR="${PEER_LISTEN_ADDR:-127.0.0.1:3799}"
 MODE="${1:-run}"
 
 require_certs() {
@@ -27,6 +28,55 @@ require_certs() {
       exit 1
     fi
   done
+}
+
+enroll_cert() {
+  local enroll_tok="${ENROLLMENT_TOKEN:?ENROLLMENT_TOKEN must be set for enrollment}"
+  local api_url="${RELAY_API_URL:?RELAY_API_URL must be set for enrollment}"
+  local vm_id="${VM_ID:?VM_ID must be set for enrollment}"
+
+  mkdir -p "${CERT_DIR}"
+  chmod 0700 "${CERT_DIR}"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "${tmp_dir}"' RETURN
+
+  local new_key="${tmp_dir}/device.key"
+  local new_csr="${tmp_dir}/device.csr"
+  local req_json="${tmp_dir}/enroll-req.json"
+  local resp_json="${tmp_dir}/enroll-resp.json"
+
+  openssl ecparam -name prime256v1 -genkey -noout -out "${new_key}"
+  chmod 0600 "${new_key}"
+  openssl req -new -key "${new_key}" -subj "/CN=boat-${vm_id}" -out "${new_csr}"
+
+  ENROLLMENT_TOKEN="${enroll_tok}" jq -n --rawfile csr "${new_csr}" \
+    '{enrollmentToken: $ENV.ENROLLMENT_TOKEN, csrPem: $csr, ttlSecs: 86400}' > "${req_json}"
+
+  local curl_ca=()
+  if [[ -n "${ENROLL_CA_CERT:-}" ]]; then
+    if [[ ! -r "${ENROLL_CA_CERT}" ]]; then
+      echo "boat-relay-agent: ENROLL_CA_CERT is not readable: ${ENROLL_CA_CERT}" >&2
+      exit 1
+    fi
+    curl_ca=(--cacert "${ENROLL_CA_CERT}")
+  fi
+
+  curl --fail --silent --show-error \
+    "${curl_ca[@]}" \
+    -X POST "${api_url%/}/v1/relay/boat/enroll" \
+    -H "Content-Type: application/json" \
+    --data-binary "@${req_json}" \
+    -o "${resp_json}"
+
+  jq -er '.caCertPem' "${resp_json}" > "${CA_CERT}"
+  jq -er '.certPem' "${resp_json}" > "${DEVICE_CERT}"
+  cp "${new_key}" "${DEVICE_KEY}"
+  chmod 0644 "${CA_CERT}"
+  chmod 0640 "${DEVICE_CERT}"
+  chmod 0600 "${DEVICE_KEY}"
+  echo "boat-relay-agent: enrolled <=24h mTLS device certificate via local CSR"
 }
 
 renew_cert() {
@@ -57,7 +107,7 @@ renew_cert() {
     --cacert "${CA_CERT}" \
     --cert "${DEVICE_CERT}" \
     --key "${DEVICE_KEY}" \
-    -X POST "${RELAY_MTLS_API_URL}/v1/relay/boat/renew" \
+    -X POST "${RELAY_MTLS_API_URL%/}/v1/relay/boat/renew" \
     -H "Content-Type: application/json" \
     --data-binary "@${payload_json}" \
     -o "${resp_json}"
@@ -79,21 +129,26 @@ run_tunnel() {
     echo "boat-relay-agent: RELAY_MTLS_URL must use wss:// (TLS 1.3 + mTLS required)" >&2
     exit 1
   fi
-  if ! command -v backplane-hub >/dev/null 2>&1; then
-    echo "boat-relay-agent: backplane-hub binary is required for mTLS tunnel" >&2
-    exit 127
+
+  if command -v bp-ent-relay >/dev/null 2>&1; then
+    echo "boat-relay-agent: dialing outbound TLS 1.3 mTLS tunnel to ${RELAY_MTLS_URL}"
+    exec bp-ent-relay boat-agent \
+      --relay-url "${RELAY_MTLS_URL}" \
+      --ca-cert "${CA_CERT}" \
+      --client-cert "${DEVICE_CERT}" \
+      --client-key "${DEVICE_KEY}" \
+      --local-hub "${LOCAL_HUB_URL}" \
+      --peer-listen "${PEER_LISTEN_ADDR}"
   fi
 
-  echo "boat-relay-agent: dialing outbound TLS 1.3 mTLS tunnel to ${RELAY_MTLS_URL}"
-  exec backplane-hub relay-agent \
-    --relay-url "${RELAY_MTLS_URL}" \
-    --ca-cert "${CA_CERT}" \
-    --client-cert "${DEVICE_CERT}" \
-    --client-key "${DEVICE_KEY}" \
-    --ipc-socket "${BACKPLANE_IPC_SOCK}"
+  echo "boat-relay-agent: bp-ent-relay binary is required for mTLS tunnel" >&2
+  exit 127
 }
 
 case "${MODE}" in
+  enroll)
+    enroll_cert
+    ;;
   run)
     run_tunnel
     ;;
@@ -101,7 +156,7 @@ case "${MODE}" in
     renew_cert
     ;;
   *)
-    echo "Usage: $0 {run|renew}" >&2
+    echo "Usage: $0 {enroll|run|renew}" >&2
     exit 2
     ;;
 esac

@@ -645,6 +645,7 @@ dependencies = [
  "bp-ent-core",
  "bp-ent-httplib",
  "bp-ent-orders",
+ "bp-ent-push",
  "bp-ent-relay",
  "flate2",
  "http 1.5.0",
@@ -799,6 +800,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "bp-ent-push"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bp-ent-core",
+ "hex",
+ "http 1.5.0",
+ "http-body-util",
+ "jsonwebtoken",
+ "rcgen",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "bp-ent-relay"
 version = "0.1.0"
 dependencies = [
@@ -811,10 +838,12 @@ dependencies = [
  "futures",
  "hex",
  "http 1.5.0",
+ "http-body-util",
  "hyper 1.13.0",
  "hyper-util",
  "rand 0.8.8",
  "rcgen",
+ "reqwest",
  "rustls 0.23.46",
  "rustls-pemfile",
  "rustls-pki-types",
@@ -834,6 +863,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 1.0.12",
  "x509-parser",
  "zeroize",
 ]
@@ -2563,6 +2593,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "h2 0.4.20",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
@@ -3619,8 +3650,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
 dependencies = [
  "bytes",
+ "data-encoding",
+ "http 1.5.0",
+ "httparse",
  "log",
  "rand 0.9.5",
+ "sha1",
  "thiserror 2.0.21",
  "utf-8",
 ]

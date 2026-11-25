@@ -1,0 +1,32 @@
+[package]
+name = "bp-ent-push"
+description = "Backplane Enterprise account-based mobile push gateway with strict per-user device isolation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bp-ent-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+hex.workspace = true
+http.workspace = true
+jsonwebtoken.workspace = true
+reqwest = { workspace = true, features = ["http2"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+bp-ent-core = { workspace = true, features = ["testkit"] }
+http-body-util = "0.1"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+tower.workspace = true

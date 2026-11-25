@@ -313,3 +313,241 @@ async fn boat_vms_enforce_tenant_isolation_billing_and_csr_lifecycle() {
     drop(records);
     tdb.cleanup().await;
 }
+
+#[tokio::test]
+async fn bidirectional_relay_bridge_forwards_allowlisted_paths_and_blocks_ssrf() {
+    use bp_ent_relay::{bridge, MtlsRelayServer};
+    use tokio::net::TcpListener;
+
+    let Some(tdb) = TestDb::new([migrator()]).await else {
+        return;
+    };
+
+    let tenant = tdb.tenant("bridge-org").await;
+    let admin = tdb.user(tenant, Role::OrgAdmin).await;
+    let tok_admin = tdb.token(&admin, AuthKind::UserToken).await;
+
+    let (state, _sink, ca) = test_state(&tdb);
+    let app = router_with_state(state.clone());
+
+    // Start client HTTP listener + mTLS listener.
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client_listener.local_addr().unwrap();
+    let app_srv = app.clone();
+    let client_task = tokio::spawn(async move {
+        let _ = axum::serve(client_listener, app_srv).await;
+    });
+
+    let mtls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mtls_addr = mtls_listener.local_addr().unwrap();
+    let mtls_server = MtlsRelayServer::new(&ca, &["localhost"], app.clone()).unwrap();
+    let mtls_task = tokio::spawn(async move {
+        let _ = mtls_server.serve(mtls_listener).await;
+    });
+
+    // Create & wake VM, issue device cert files into temp dir.
+    let created_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/vms")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":"bridge-boat"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_resp.status(), StatusCode::OK);
+    let created: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(created_resp.into_body(), 65536).await.unwrap(),
+    )
+    .unwrap();
+    let vm_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+
+    let wake_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/vms/{vm_id}/wake"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wake_resp.status(), StatusCode::OK);
+
+    let cert_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/vms/{vm_id}/cert"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cert_resp.status(), StatusCode::OK);
+    let cert_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(cert_resp.into_body(), 65536).await.unwrap(),
+    )
+    .unwrap();
+
+    let tmp_dir = std::env::temp_dir().join(format!("bp-bridge-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ca_path = tmp_dir.join("ca.pem");
+    let crt_path = tmp_dir.join("device.crt");
+    let key_path = tmp_dir.join("device.key");
+    let tok_path = tmp_dir.join("user.token");
+    std::fs::write(&ca_path, cert_json["caCertPem"].as_str().unwrap()).unwrap();
+    std::fs::write(&crt_path, cert_json["certPem"].as_str().unwrap()).unwrap();
+    std::fs::write(&key_path, cert_json["keyPem"].as_str().unwrap()).unwrap();
+    std::fs::write(&tok_path, &tok_admin).unwrap();
+
+    // Two mock local hubs (Boat & Desktop).
+    let boat_hub_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let boat_hub_addr = boat_hub_l.local_addr().unwrap();
+    let boat_hub_app = axum::Router::new()
+        .route(
+            "/hello",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+        )
+        .route(
+            "/far/rpc",
+            axum::routing::post(|headers: axum::http::HeaderMap, body: String| async move {
+                let peer = headers
+                    .get("x-backplane-peer")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let had_auth = headers.contains_key(axum::http::header::AUTHORIZATION);
+                axum::Json(serde_json::json!({ "from": "boat", "peer": peer, "hadAuth": had_auth, "echo": body }))
+            }),
+        );
+    let boat_hub_task = tokio::spawn(async move {
+        let _ = axum::serve(boat_hub_l, boat_hub_app).await;
+    });
+
+    let desk_hub_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let desk_hub_addr = desk_hub_l.local_addr().unwrap();
+    let desk_hub_app = axum::Router::new().route(
+        "/far/rpc",
+        axum::routing::post(|body: String| async move {
+            axum::Json(serde_json::json!({ "from": "desktop", "echo": body }))
+        }),
+    );
+    let desk_hub_task = tokio::spawn(async move {
+        let _ = axum::serve(desk_hub_l, desk_hub_app).await;
+    });
+
+    // Reserve peer listener ports by picking free ports via TcpListener then dropping, or spawning bridge directly.
+    let boat_peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let boat_peer_addr = boat_peer_l.local_addr().unwrap();
+    drop(boat_peer_l);
+    let desk_peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let desk_peer_addr = desk_peer_l.local_addr().unwrap();
+    drop(desk_peer_l);
+
+    let boat_agent_task = tokio::spawn({
+        let ca_path = ca_path.clone();
+        let crt_path = crt_path.clone();
+        let key_path = key_path.clone();
+        async move {
+            let _ = bridge::run_boat_agent(
+                format!("wss://localhost:{}/v1/relay/boat/connect", mtls_addr.port()),
+                ca_path,
+                crt_path,
+                key_path,
+                format!("http://{boat_hub_addr}"),
+                boat_peer_addr,
+            )
+            .await;
+        }
+    });
+
+    let desk_bridge_task = tokio::spawn(async move {
+        let _ = bridge::run_desktop_bridge(
+            format!("http://127.0.0.1:{}", client_addr.port()),
+            vm_id,
+            tok_path,
+            None,
+            format!("http://{desk_hub_addr}"),
+            desk_peer_addr,
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    // Wait until end-to-end Desktop -> Boat works.
+    let mut reached_boat = false;
+    for _ in 0..40 {
+        if let Ok(r) = http
+            .post(format!("http://{desk_peer_addr}/far/rpc"))
+            .header("x-backplane-peer", "p_desk")
+            .header("authorization", "Bearer must-not-forward")
+            .body(r#"{"m":"ping"}"#)
+            .send()
+            .await
+        {
+            if r.status() == 200 {
+                let v: serde_json::Value = r.json().await.unwrap();
+                assert_eq!(v["from"], "boat");
+                assert_eq!(v["peer"], "p_desk");
+                assert_eq!(v["hadAuth"], false, "Authorization header must be stripped");
+                reached_boat = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(reached_boat, "desktop-bridge did not reach boat local hub");
+
+    // GET /hello works over relay (used by hub peer discovery).
+    let r_hello = http
+        .get(format!("http://{desk_peer_addr}/hello"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_hello.status(), 200);
+
+    // Reverse direction: Boat -> Desktop works.
+    let r_desk = http
+        .post(format!("http://{boat_peer_addr}/far/rpc"))
+        .body(r#"{"m":"launch"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_desk.status(), 200);
+    let v_desk: serde_json::Value = r_desk.json().await.unwrap();
+    assert_eq!(v_desk["from"], "desktop");
+
+    // Non-allowlisted paths and query strings MUST be rejected with 403 Forbidden.
+    let r_ssrf = http
+        .get(format!("http://{desk_peer_addr}/v1/admin/users"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_ssrf.status(), 403);
+    let r_qs = http
+        .post(format!("http://{desk_peer_addr}/far/rpc?extra=1"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_qs.status(), 403);
+
+    boat_agent_task.abort();
+    desk_bridge_task.abort();
+    boat_hub_task.abort();
+    desk_hub_task.abort();
+    mtls_task.abort();
+    client_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    tdb.cleanup().await;
+}
