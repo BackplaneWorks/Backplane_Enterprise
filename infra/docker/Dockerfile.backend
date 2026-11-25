@@ -7,7 +7,7 @@ RUN npm ci --ignore-scripts
 COPY web/ ./
 RUN npm run build
 
-FROM rust:1.86-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 ARG BIN=bp-ent-api
 ARG FEATURES=aws-kms
