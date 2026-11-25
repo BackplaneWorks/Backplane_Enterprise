@@ -156,6 +156,7 @@ impl HttpApnsSender {
         let apns_http = reqwest::Client::builder()
             .use_rustls_tls()
             .https_only(true)
+            .http2_adaptive_window(true)
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()

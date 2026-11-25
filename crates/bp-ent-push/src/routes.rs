@@ -306,6 +306,15 @@ async fn register_device(
     let handle = device_handle(token);
 
     let mut tx = st.ctx.db.tenant_tx(p.tenant_id).await?;
+    sqlx::query(
+        "DELETE FROM push_devices WHERE tenant_id = $1 AND token_hash = $2 AND user_id <> $3",
+    )
+    .bind(p.tenant_id.0)
+    .bind(token_hash.as_slice())
+    .bind(p.user_id.0)
+    .execute(&mut *tx)
+    .await?;
+
     let existing_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM push_devices WHERE tenant_id = $1 AND user_id = $2 AND token_hash = $3 FOR UPDATE",
     )

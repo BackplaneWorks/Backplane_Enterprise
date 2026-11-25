@@ -389,3 +389,69 @@ async fn push_enforces_20_device_cap_per_user() {
 
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn reregistering_token_moves_device_between_users_and_stops_old_owner_pushes() {
+    let Some(db) = TestDb::new([migrator()]).await else {
+        return;
+    };
+    let mock = Arc::new(MockApns::default());
+    let app = router_with_sender(db.app_ctx(), mock.clone(), 50);
+    let tenant = db.tenant("move-org").await;
+    let user_a = db.user(tenant, Role::Engineer).await;
+    let user_b = db.user(tenant, Role::Engineer).await;
+    let tok_a = db.token(&user_a, AuthKind::UserToken).await;
+    let tok_b = db.token(&user_b, AuthKind::UserToken).await;
+
+    let shared_apns_token = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let (st, _) = call(
+        &app,
+        Method::POST,
+        "/v1/push/devices",
+        &tok_a,
+        Some(json!({"token": shared_apns_token, "platform": "ios", "bundle": "dev.backplane.mobile"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Re-registering the same physical device token under User B moves ownership to User B.
+    let (st, _) = call(
+        &app,
+        Method::POST,
+        "/v1/push/devices",
+        &tok_b,
+        Some(json!({"token": shared_apns_token, "platform": "ios", "bundle": "dev.backplane.mobile"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, list_a) = call(&app, Method::GET, "/v1/push/devices", &tok_a, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(list_a.as_array().unwrap().is_empty(), "old owner must no longer see the device");
+
+    let (st, send_a) = call(
+        &app,
+        Method::POST,
+        "/v1/push/send",
+        &tok_a,
+        Some(json!({"payload": {"aps": {"alert": "for-a"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(send_a["sent"], 0);
+    assert!(mock.take_calls().is_empty());
+
+    let (st, send_b) = call(
+        &app,
+        Method::POST,
+        "/v1/push/send",
+        &tok_b,
+        Some(json!({"payload": {"aps": {"alert": "for-b"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(send_b["sent"], 1);
+    assert_eq!(mock.take_calls().len(), 1);
+
+    db.cleanup().await;
+}

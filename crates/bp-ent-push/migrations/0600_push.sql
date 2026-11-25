@@ -20,7 +20,7 @@ CREATE TABLE push_devices (
   muted        boolean NOT NULL DEFAULT false,
   created_at   timestamptz NOT NULL DEFAULT now(),
   updated_at   timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (tenant_id, user_id, token_hash),
+  UNIQUE (tenant_id, token_hash),
   FOREIGN KEY (tenant_id, user_id)
     REFERENCES users (tenant_id, id) ON DELETE CASCADE
 );
