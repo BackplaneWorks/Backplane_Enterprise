@@ -79,7 +79,7 @@ services:
       - |
         apk add --no-cache openssl >/dev/null
         if [ ! -f /etc/backplane-boat-ca/ca.crt ] || [ ! -f /etc/backplane-boat-ca/ca.key ]; then
-          openssl ecparam -name prime256v1 -genkey -noout -out /etc/backplane-boat-ca/ca.key
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /etc/backplane-boat-ca/ca.key
           openssl req -new -x509 -sha256 -days 3650 \
             -key /etc/backplane-boat-ca/ca.key \
             -subj "/O=Backplane Enterprise/CN=Backplane Boat Device CA" \
