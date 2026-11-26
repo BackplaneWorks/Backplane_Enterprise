@@ -27,5 +27,8 @@ pub use lifecycle::{
 };
 pub use mtls_server::MtlsRelayServer;
 pub use protocol::{RelayChannel, RelayFrame, MAX_FRAME_BYTES, MAX_WS_MESSAGE_BYTES};
-pub use registry::TunnelRegistry;
-pub use routes::{migrator, router, router_with_state, BoatVmDto, RelayConfig, RelayState};
+pub use registry::{TunnelPacket, TunnelRegistry};
+pub use routes::{
+    client_router_with_state, migrator, mtls_router_with_state, router, router_with_state,
+    BoatVmDto, RelayConfig, RelayState,
+};

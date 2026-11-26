@@ -415,7 +415,8 @@ async fn mounts(ctx: &AppCtx) -> anyhow::Result<Mounts> {
         {
             state.meter_sink = std::sync::Arc::new(StripeUsageSink { svc: orders.clone() });
         }
-        let relay_router = bp_ent_relay::router_with_state(state.clone());
+        let client_relay_router = bp_ent_relay::client_router_with_state(state.clone());
+        let mtls_relay_router = bp_ent_relay::mtls_router_with_state(state.clone());
 
         // Boat VMs dial in over mutual TLS on their own port.
         let mtls_addr: SocketAddr = bp_ent_core::config::env_parse("BP_RELAY_MTLS_ADDR", SocketAddr::from(([0, 0, 0, 0], 8443)))?;
@@ -426,7 +427,7 @@ async fn mounts(ctx: &AppCtx) -> anyhow::Result<Mounts> {
             .filter(|s| !s.is_empty())
             .collect();
         let mtls_hosts = if mtls_hosts.is_empty() { vec!["localhost"] } else { mtls_hosts };
-        let server = MtlsRelayServer::new(&state.ca, &mtls_hosts, relay_router.clone())?;
+        let server = MtlsRelayServer::new(&state.ca, &mtls_hosts, mtls_relay_router)?;
         let listener = tokio::net::TcpListener::bind(mtls_addr).await.with_context(|| format!("cannot bind relay mTLS port {mtls_addr}"))?;
         tracing::info!(%mtls_addr, "Boat VM mTLS relay listening");
         tokio::spawn(async move {
@@ -440,7 +441,7 @@ async fn mounts(ctx: &AppCtx) -> anyhow::Result<Mounts> {
             let r = reaper.clone();
             async move { bp_ent_relay::reap_idle_vms(&r.ctx.db, &r.provisioner, &r.meter_sink, r.config.idle_timeout).await.map(|_| ()).map_err(|e| e.to_string()) }
         });
-        m.routers.push(relay_router);
+        m.routers.push(client_relay_router);
     }
 
     Ok(m)

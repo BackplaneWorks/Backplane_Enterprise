@@ -11,6 +11,13 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
 use uuid::Uuid;
 
+/// Opaque validated frame forwarded across the relay without re-parsing JSON or base64.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TunnelPacket {
+    Bin(Vec<u8>),
+    Json(RelayFrame),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VmKey {
     pub tenant_id: TenantId,
@@ -26,7 +33,7 @@ impl VmKey {
 #[derive(Clone)]
 struct ActiveClient {
     client_session_id: Uuid,
-    tx: mpsc::Sender<RelayFrame>,
+    tx: mpsc::Sender<TunnelPacket>,
 }
 
 #[derive(Clone)]
@@ -34,7 +41,7 @@ struct ActiveTunnel {
     session_id: Uuid,
     connected_at: OffsetDateTime,
     last_heartbeat: Arc<Mutex<OffsetDateTime>>,
-    to_vm_tx: mpsc::Sender<RelayFrame>,
+    to_vm_tx: mpsc::Sender<TunnelPacket>,
     active_client: Arc<Mutex<Option<ActiveClient>>>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -58,7 +65,7 @@ impl TunnelRegistry {
         &self,
         tenant_id: TenantId,
         vm_id: Uuid,
-    ) -> (Uuid, mpsc::Receiver<RelayFrame>, watch::Receiver<bool>) {
+    ) -> (Uuid, mpsc::Receiver<TunnelPacket>, watch::Receiver<bool>) {
         let key = VmKey::new(tenant_id, vm_id);
         let session_id = Uuid::new_v4();
         let (to_vm_tx, to_vm_rx) = mpsc::channel(256);
@@ -114,6 +121,25 @@ impl TunnelRegistry {
             .contains_key(&VmKey::new(tenant_id, vm_id))
     }
 
+    pub async fn has_active_client(&self, tenant_id: TenantId, vm_id: Uuid) -> bool {
+        let Some(tunnel) = self
+            .tunnels
+            .read()
+            .await
+            .get(&VmKey::new(tenant_id, vm_id))
+            .cloned()
+        else {
+            return false;
+        };
+        let active = tunnel
+            .active_client
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|c| !c.tx.is_closed());
+        active
+    }
+
     pub async fn touch_heartbeat(&self, tenant_id: TenantId, vm_id: Uuid) {
         if let Some(t) = self.tunnels.read().await.get(&VmKey::new(tenant_id, vm_id)) {
             *t.last_heartbeat.lock().await = OffsetDateTime::now_utc();
@@ -136,8 +162,8 @@ impl TunnelRegistry {
         vm_id: Uuid,
         client_session_id: Uuid,
     ) -> Result<(
-        mpsc::Sender<RelayFrame>,
-        mpsc::Receiver<RelayFrame>,
+        mpsc::Sender<TunnelPacket>,
+        mpsc::Receiver<TunnelPacket>,
         watch::Receiver<bool>,
     )> {
         let key = VmKey::new(tenant_id, vm_id);
@@ -194,7 +220,7 @@ impl TunnelRegistry {
         &self,
         tenant_id: TenantId,
         vm_id: Uuid,
-        frame: RelayFrame,
+        packet: TunnelPacket,
     ) -> Result<()> {
         let key = VmKey::new(tenant_id, vm_id);
         let tunnel = self
@@ -212,7 +238,16 @@ impl TunnelRegistry {
             .as_ref()
             .map(|c| c.tx.clone());
         if let Some(tx) = maybe_tx {
-            let _ = tx.send(frame).await;
+            if tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(packet))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    %tenant_id,
+                    %vm_id,
+                    "dropping vm->desktop packet: client channel backpressured or closed"
+                );
+            }
         }
         Ok(())
     }
@@ -251,8 +286,9 @@ mod tests {
         let c1 = Uuid::new_v4();
         let (to_vm_a, _from_vm_a, _c1_shut) = reg.attach_client(tenant_a, vm_id, c1).await.unwrap();
         let frame = RelayFrame::new(RelayChannel::BackplaneChat, b"hello".to_vec()).unwrap();
-        to_vm_a.send(frame.clone()).await.unwrap();
-        assert_eq!(vm_rx_a.recv().await.unwrap(), frame);
+        let pkt = TunnelPacket::Json(frame);
+        to_vm_a.send(pkt.clone()).await.unwrap();
+        assert_eq!(vm_rx_a.recv().await.unwrap(), pkt);
 
         // Concurrent second client is rejected with 409 Conflict (no silent hijack).
         let c2 = Uuid::new_v4();

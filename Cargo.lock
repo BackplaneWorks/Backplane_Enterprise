@@ -835,6 +835,7 @@ dependencies = [
  "base64 0.22.1",
  "bp-ent-core",
  "bytes",
+ "flate2",
  "futures",
  "hex",
  "http 1.5.0",

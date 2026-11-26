@@ -551,3 +551,414 @@ async fn bidirectional_relay_bridge_forwards_allowlisted_paths_and_blocks_ssrf()
     let _ = std::fs::remove_dir_all(&tmp_dir);
     tdb.cleanup().await;
 }
+
+#[tokio::test]
+async fn relay_enforces_per_user_isolation_surface_separation_and_far_ws_bridging() {
+    use bp_ent_relay::{
+        bridge, client_router_with_state, mtls_router_with_state, MtlsRelayServer,
+    };
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    async fn connect_plain_ws(
+        addr: std::net::SocketAddr,
+        req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<TcpStream>,
+        Box<tokio_tungstenite::tungstenite::Error>,
+    > {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(req, tcp)
+            .await
+            .map_err(Box::new)?;
+        Ok(ws)
+    }
+
+    let Some(tdb) = TestDb::new([migrator()]).await else {
+        return;
+    };
+
+    let tenant_a = tdb.tenant("iso-org-a").await;
+    let tenant_b = tdb.tenant("iso-org-b").await;
+
+    let admin_a = tdb.user(tenant_a, Role::OrgAdmin).await;
+    let eng_a1 = tdb.user(tenant_a, Role::Engineer).await;
+    let eng_a2 = tdb.user(tenant_a, Role::Engineer).await;
+    let admin_b = tdb.user(tenant_b, Role::OrgAdmin).await;
+
+    let tok_admin_a = tdb.token(&admin_a, AuthKind::UserToken).await;
+    let tok_eng_a1 = tdb.token(&eng_a1, AuthKind::UserToken).await;
+    let tok_eng_a2 = tdb.token(&eng_a2, AuthKind::UserToken).await;
+    let tok_admin_b = tdb.token(&admin_b, AuthKind::UserToken).await;
+    let tok_device_a1 = tdb.token(&eng_a1, AuthKind::DeviceToken).await;
+
+    let (state, _sink, ca) = test_state(&tdb);
+    let client_app = client_router_with_state(state.clone());
+    let mtls_app = mtls_router_with_state(state.clone());
+
+    // 1. Verify route surface separation: client router has no mTLS connect, mTLS router has no /v1/vms.
+    let r_no_mtls_on_client = client_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/relay/boat/connect")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_no_mtls_on_client.status(), StatusCode::NOT_FOUND);
+
+    let r_no_vms_on_mtls = mtls_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/vms")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin_a}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_no_vms_on_mtls.status(), StatusCode::NOT_FOUND);
+
+    // 2. Create & wake VM assigned strictly to eng_a1.
+    let created_resp = client_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/vms")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin_a}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "eng1-boat",
+                        "assignedUserId": eng_a1.user_id.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_resp.status(), StatusCode::OK);
+    let created: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(created_resp.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let vm_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+
+    let cert_resp = client_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/vms/{vm_id}/cert"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin_a}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cert_resp.status(), StatusCode::OK);
+    let cert_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(cert_resp.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let wake_resp = client_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/vms/{vm_id}/wake"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_eng_a1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wake_resp.status(), StatusCode::OK);
+
+    // 3. Start listeners so real WebSocket upgrades can be tested.
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client_listener.local_addr().unwrap();
+    let client_srv = client_app.clone();
+    let client_task = tokio::spawn(async move {
+        let _ = axum::serve(client_listener, client_srv).await;
+    });
+
+    let mtls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mtls_addr = mtls_listener.local_addr().unwrap();
+    let mtls_server = MtlsRelayServer::new(&ca, &["localhost"], mtls_app.clone()).unwrap();
+    let mtls_task = tokio::spawn(async move {
+        let _ = mtls_server.serve(mtls_listener).await;
+    });
+
+    // Cross-tenant admin, same-tenant other engineer, same-tenant OrgAdmin, and DeviceToken MUST all be rejected!
+    for (label, tok, expected) in [
+        ("tenant_b_admin", tok_admin_b.as_str(), StatusCode::NOT_FOUND),
+        ("same_tenant_eng_a2", tok_eng_a2.as_str(), StatusCode::NOT_FOUND),
+        ("same_tenant_admin_a", tok_admin_a.as_str(), StatusCode::NOT_FOUND),
+        ("device_token", tok_device_a1.as_str(), StatusCode::FORBIDDEN),
+    ] {
+        let mut req = format!("ws://127.0.0.1:{}/v1/relay/desktop/connect/{vm_id}", client_addr.port())
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {tok}")).unwrap(),
+        );
+        let err = connect_plain_ws(client_addr, req).await.unwrap_err();
+        match *err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status(), expected, "{label} got {}", resp.status());
+            }
+            other => panic!("{label} unexpected error: {other:?}"),
+        }
+    }
+
+    // 4. Assigned owner connects desktop-bridge and Boat connects via mTLS; test /far/ws binary bridging.
+    let tmp_dir = std::env::temp_dir().join(format!("bp-iso-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ca_path = tmp_dir.join("ca.pem");
+    let crt_path = tmp_dir.join("device.crt");
+    let key_path = tmp_dir.join("device.key");
+    let tok_path = tmp_dir.join("eng1.token");
+    std::fs::write(&ca_path, cert_json["caCertPem"].as_str().unwrap()).unwrap();
+    std::fs::write(&crt_path, cert_json["certPem"].as_str().unwrap()).unwrap();
+    std::fs::write(&key_path, cert_json["keyPem"].as_str().unwrap()).unwrap();
+    std::fs::write(&tok_path, &tok_eng_a1).unwrap();
+
+    // Mock desktop hub supporting /far/ws upgrade and checking stripped Authorization + preserved HMAC headers.
+    let desk_hub_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let desk_hub_addr = desk_hub_l.local_addr().unwrap();
+    let desk_hub_app = axum::Router::new()
+        .route(
+            "/far/rpc",
+            axum::routing::post(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+        )
+        .route(
+            "/far/ws",
+            axum::routing::get(
+                |headers: axum::http::HeaderMap, ws: axum::extract::ws::WebSocketUpgrade| async move {
+                    let peer = headers
+                        .get("x-backplane-peer")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let ts = headers
+                        .get("x-backplane-timestamp")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let sig = headers
+                        .get("x-backplane-signature")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let had_auth = headers.contains_key(header::AUTHORIZATION);
+                    ws.on_upgrade(move |mut sock| async move {
+                        let meta = serde_json::json!({
+                            "peer": peer,
+                            "ts": ts,
+                            "sig": sig,
+                            "hadAuth": had_auth,
+                        })
+                        .to_string();
+                        let _ = sock
+                            .send(axum::extract::ws::Message::Binary(meta.into_bytes().into()))
+                            .await;
+                        while let Some(Ok(msg)) = sock.next().await {
+                            match msg {
+                                axum::extract::ws::Message::Binary(b) => {
+                                    if sock
+                                        .send(axum::extract::ws::Message::Binary(b))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                axum::extract::ws::Message::Close(_) => break,
+                                _ => {}
+                            }
+                        }
+                    })
+                },
+            ),
+        );
+    let desk_hub_task = tokio::spawn(async move {
+        let _ = axum::serve(desk_hub_l, desk_hub_app).await;
+    });
+
+    let boat_hub_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let boat_hub_addr = boat_hub_l.local_addr().unwrap();
+    let boat_hub_app = axum::Router::new().route(
+        "/hello",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+    );
+    let boat_hub_task = tokio::spawn(async move {
+        let _ = axum::serve(boat_hub_l, boat_hub_app).await;
+    });
+
+    let boat_peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let boat_peer_addr = boat_peer_l.local_addr().unwrap();
+    drop(boat_peer_l);
+    let desk_peer_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let desk_peer_addr = desk_peer_l.local_addr().unwrap();
+    drop(desk_peer_l);
+
+    let boat_agent_task = tokio::spawn(async move {
+        let _ = bridge::run_boat_agent(
+            format!("wss://localhost:{}/v1/relay/boat/connect", mtls_addr.port()),
+            ca_path,
+            crt_path,
+            key_path,
+            format!("http://{boat_hub_addr}"),
+            boat_peer_addr,
+        )
+        .await;
+    });
+
+    let desk_bridge_task = tokio::spawn(async move {
+        let _ = bridge::run_desktop_bridge(
+            format!("http://127.0.0.1:{}", client_addr.port()),
+            vm_id,
+            tok_path,
+            None,
+            format!("http://{desk_hub_addr}"),
+            desk_peer_addr,
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let mut ready = false;
+    for _ in 0..40 {
+        if let Ok(r) = http
+            .post(format!("http://{boat_peer_addr}/far/rpc"))
+            .body("{}")
+            .send()
+            .await
+        {
+            if r.status() == 200 {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "eng_a1 desktop-bridge did not connect to boat");
+
+    // End-to-end /far/ws upgrade from Boat -> Relay -> Desktop hub!
+    let mut ws_req = format!("ws://{boat_peer_addr}/far/ws")
+        .into_client_request()
+        .unwrap();
+    ws_req
+        .headers_mut()
+        .insert("X-Backplane-Peer", "p_boat".parse().unwrap());
+    ws_req
+        .headers_mut()
+        .insert("X-Backplane-Timestamp", "1700000000".parse().unwrap());
+    ws_req
+        .headers_mut()
+        .insert("X-Backplane-Signature", "sha256=deadbeef".parse().unwrap());
+    ws_req.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer must-not-cross-tunnel".parse().unwrap(),
+    );
+
+    let mut ws_stream = connect_plain_ws(boat_peer_addr, ws_req).await.unwrap();
+    let first = ws_stream.next().await.unwrap().unwrap();
+    let meta: serde_json::Value = match first {
+        Message::Binary(b) => serde_json::from_slice(&b).unwrap(),
+        other => panic!("expected binary metadata frame, got {other:?}"),
+    };
+    assert_eq!(meta["peer"], "p_boat");
+    assert_eq!(meta["ts"], "1700000000");
+    assert_eq!(meta["sig"], "sha256=deadbeef");
+    assert_eq!(meta["hadAuth"], false);
+
+    // Binary echo round-trip over /far/ws.
+    let sample = vec![0x01, 0x02, 0x03, 0xfe, 0xff];
+    ws_stream
+        .send(Message::Binary(sample.clone().into()))
+        .await
+        .unwrap();
+    let echoed = ws_stream.next().await.unwrap().unwrap();
+    assert_eq!(echoed, Message::Binary(sample.into()));
+    let _ = ws_stream.close(None).await;
+
+    // Non-/far/ws upgrade must be rejected 403.
+    let bad_ws_req = format!("ws://{boat_peer_addr}/v1/admin")
+        .into_client_request()
+        .unwrap();
+    let bad_err = connect_plain_ws(boat_peer_addr, bad_ws_req)
+        .await
+        .unwrap_err();
+    match *bad_err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 403),
+        other => panic!("expected HTTP 403, got {other:?}"),
+    }
+
+    // Stop VM -> force disconnects desktop & boat sessions, closes boat_relay_sessions row, writes audit entries.
+    let stop_resp = client_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/vms/{vm_id}/stop"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_eng_a1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop_resp.status(), StatusCode::OK);
+
+    let mut open_sessions = 1i64;
+    for _ in 0..30 {
+        open_sessions = sqlx::query_scalar(
+            "SELECT count(*) FROM boat_relay_sessions WHERE vm_id = $1 AND disconnected_at IS NULL",
+        )
+        .bind(vm_id)
+        .fetch_one(tdb.admin_pool())
+        .await
+        .unwrap();
+        if open_sessions == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(open_sessions, 0, "relay sessions must close cleanly without orphans");
+
+    let audit_actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE tenant_id = $1 AND target = $2 ORDER BY seq ASC",
+    )
+    .bind(tenant_a.0)
+    .bind(format!("vm:{vm_id}"))
+    .fetch_all(tdb.admin_pool())
+    .await
+    .unwrap();
+    assert!(audit_actions.iter().any(|a| a == "boat_vm.relay_connected"));
+    assert!(audit_actions.iter().any(|a| a == "boat_vm.relay_disconnected"));
+
+    boat_agent_task.abort();
+    desk_bridge_task.abort();
+    boat_hub_task.abort();
+    desk_hub_task.abort();
+    mtls_task.abort();
+    client_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    tdb.cleanup().await;
+}

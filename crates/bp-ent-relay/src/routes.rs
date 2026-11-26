@@ -7,14 +7,14 @@ use crate::lifecycle::{
     VmProvisioner, VmState,
 };
 use crate::protocol::{RelayChannel, RelayFrame, MAX_WS_MESSAGE_BYTES};
-use crate::registry::TunnelRegistry;
+use crate::registry::{TunnelPacket, TunnelRegistry};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use bp_ent_core::crypto::{ct_eq, random_token, sha256};
-use bp_ent_core::{audit, AppCtx, Error, Permission, Principal, Result, TenantId};
+use bp_ent_core::{audit, AppCtx, AuthKind, Error, Permission, Principal, Result, TenantId};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -26,6 +26,11 @@ use uuid::Uuid;
 
 const RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 const ACTIVITY_TOUCH_THROTTLE: Duration = Duration::from_secs(60);
+const WS_PING_INTERVAL: Duration = Duration::from_secs(25);
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_FRAMES_PER_MIN: u32 = 12_000;
+const MAX_BYTES_PER_MIN: u64 = 64 * 1024 * 1024;
 const ENROLL_TOKEN_TTL_SECS: i64 = 15 * 60;
 
 #[derive(Clone)]
@@ -85,8 +90,20 @@ pub fn router(ctx: AppCtx) -> Router {
     router_with_state(state)
 }
 
-/// Mountable router with explicit `RelayState` (e.g. custom `BoatCa`, `VmProvisioner`, `UsageMeterSink`).
+/// Mountable router with explicit `RelayState` (merges both client and mTLS surfaces; useful for tests).
 pub fn router_with_state(state: RelayState) -> Router {
+    client_router_with_state(state.clone()).merge(mtls_routes_without_health(state))
+}
+
+fn mtls_routes_without_health(state: RelayState) -> Router {
+    Router::new()
+        .route("/v1/relay/boat/connect", get(boat_ws_connect))
+        .route("/v1/relay/boat/renew", post(boat_csr_renew))
+        .with_state(state)
+}
+
+/// Client/API HTTP listener surface (user-authed VM management + desktop WSS + token-gated Boat enrollment).
+pub fn client_router_with_state(state: RelayState) -> Router {
     let user_authed = bp_ent_core::http::with_auth(
         Router::new()
             .route("/v1/vms", get(list_vms).post(create_vm))
@@ -103,14 +120,17 @@ pub fn router_with_state(state: RelayState) -> Router {
         &state.ctx,
     );
 
-    let boat_mtls = Router::new()
-        .route("/v1/relay/boat/connect", get(boat_ws_connect))
-        .route("/v1/relay/boat/renew", post(boat_csr_renew))
+    let public_enroll = Router::new()
         .route("/v1/relay/boat/enroll", post(boat_csr_enroll))
         .route("/v1/relay/health", get(health))
         .with_state(state);
 
-    Router::new().merge(user_authed).merge(boat_mtls)
+    Router::new().merge(user_authed).merge(public_enroll)
+}
+
+/// Boat mTLS listener surface ONLY (TLS 1.3 + mandatory Boat CA client cert).
+pub fn mtls_router_with_state(state: RelayState) -> Router {
+    mtls_routes_without_health(state).route("/v1/relay/health", get(health))
 }
 
 // ------------------------------------------------------------------- DTOs
@@ -272,6 +292,63 @@ fn check_vm_access(principal: &Principal, assigned_user_id: Option<Uuid>) -> Res
     } else {
         Err(Error::NotFound)
     }
+}
+
+/// Strict tunnel-connection authorization:
+/// - `DeviceToken` credentials may never open a desktop relay tunnel (`403`).
+/// - An assigned VM may ONLY be connected to by its `assigned_user_id` (not even
+///   another `OrgAdmin` in the same tenant, preventing cross-user desktop hijack).
+/// - An unassigned VM (`assigned_user_id IS NULL`) requires `Permission::VmManage`.
+pub fn check_vm_connect_access(principal: &Principal, assigned_user_id: Option<Uuid>) -> Result<()> {
+    if principal.auth == AuthKind::DeviceToken {
+        return Err(Error::Forbidden);
+    }
+    match assigned_user_id {
+        Some(owner) => {
+            principal.require(Permission::VmUse)?;
+            if owner == principal.user_id.0 {
+                Ok(())
+            } else {
+                Err(Error::NotFound)
+            }
+        }
+        None => principal.require(Permission::VmManage),
+    }
+}
+
+struct FrameRateLimiter {
+    window_start: Instant,
+    count: u32,
+    bytes: u64,
+    max_per_min: u32,
+    max_bytes_per_min: u64,
+}
+
+impl FrameRateLimiter {
+    fn new(max_per_min: u32, max_bytes_per_min: u64) -> Self {
+        Self {
+            window_start: Instant::now(),
+            count: 0,
+            bytes: 0,
+            max_per_min,
+            max_bytes_per_min,
+        }
+    }
+
+    fn allow(&mut self, frame_bytes: usize) -> bool {
+        if self.window_start.elapsed() >= Duration::from_secs(60) {
+            self.window_start = Instant::now();
+            self.count = 0;
+            self.bytes = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(frame_bytes as u64);
+        self.count <= self.max_per_min && self.bytes <= self.max_bytes_per_min
+    }
+}
+
+async fn send_ws_timed(ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>, msg: Message) -> bool {
+    matches!(tokio::time::timeout(WS_SEND_TIMEOUT, ws_tx.send(msg)).await, Ok(Ok(())))
 }
 
 fn parse_enrollment_token(token: &str) -> Option<TenantId> {
@@ -940,10 +1017,14 @@ async fn desktop_ws_connect(
     .ok_or(Error::NotFound)?;
 
     let assigned: Option<Uuid> = row.get("assigned_user_id");
-    check_vm_access(&principal, assigned)?;
+    check_vm_connect_access(&principal, assigned)?;
     let vm_state = VmState::parse(&row.get::<String, _>("state"))?;
     if vm_state == VmState::Terminated {
         return Err(Error::NotFound);
+    }
+
+    if state.registry.has_active_client(principal.tenant_id, vm_id).await {
+        return Err(Error::conflict("boat vm already has an active desktop session"));
     }
 
     let now = OffsetDateTime::now_utc();
@@ -967,25 +1048,9 @@ async fn desktop_ws_connect(
             .await?;
     }
 
-    let session_id = Uuid::new_v4();
-    let client_kind = match principal.auth {
-        bp_ent_core::AuthKind::Session => "web",
-        _ => "desktop",
-    };
-    sqlx::query(
-        "INSERT INTO boat_relay_sessions (id, tenant_id, vm_id, user_id, client_kind) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(session_id)
-    .bind(principal.tenant_id.0)
-    .bind(vm_id)
-    .bind(principal.user_id.0)
-    .bind(client_kind)
-    .execute(&mut *tx)
-    .await?;
-
     tx.commit().await?;
 
+    let session_id = Uuid::new_v4();
     Ok(ws
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
@@ -998,8 +1063,8 @@ async fn desktop_session_still_valid(state: &RelayState, principal: &Principal, 
     let Ok(mut tx) = state.ctx.db.tenant_tx(principal.tenant_id).await else {
         return false;
     };
-    let tok_ok: Option<bool> = sqlx::query_scalar(
-        "SELECT t.revoked_at IS NULL AND t.expires_at > now() AND u.status = 'active' \
+    let tok_row = sqlx::query(
+        "SELECT (t.revoked_at IS NULL AND t.expires_at > now() AND u.status = 'active') AS ok, u.role \
          FROM auth_tokens t JOIN users u ON u.tenant_id = t.tenant_id AND u.id = t.user_id \
          WHERE t.tenant_id = $1 AND t.id = $2",
     )
@@ -1010,8 +1075,8 @@ async fn desktop_session_still_valid(state: &RelayState, principal: &Principal, 
     .ok()
     .flatten();
 
-    let vm_ok: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM boat_vms WHERE tenant_id = $1 AND id = $2",
+    let vm_row = sqlx::query(
+        "SELECT state, assigned_user_id FROM boat_vms WHERE tenant_id = $1 AND id = $2",
     )
     .bind(principal.tenant_id.0)
     .bind(vm_id)
@@ -1021,7 +1086,100 @@ async fn desktop_session_still_valid(state: &RelayState, principal: &Principal, 
     .flatten();
 
     let _ = tx.commit().await;
-    tok_ok == Some(true) && vm_ok.as_deref() == Some("running")
+    let (Some(tok_row), Some(vm_row)) = (tok_row, vm_row) else {
+        return false;
+    };
+    let tok_ok: bool = tok_row.get("ok");
+    let role_str: String = tok_row.get("role");
+    let Ok(current_role) = bp_ent_core::Role::parse(&role_str) else {
+        return false;
+    };
+    let mut refreshed = principal.clone();
+    refreshed.role = current_role;
+
+    let vm_state: String = vm_row.get("state");
+    let assigned: Option<Uuid> = vm_row.get("assigned_user_id");
+    tok_ok
+        && vm_state == "running"
+        && check_vm_connect_access(&refreshed, assigned).is_ok()
+}
+
+async fn open_desktop_session_record(
+    state: &RelayState,
+    principal: &Principal,
+    vm_id: Uuid,
+    session_id: Uuid,
+) -> std::result::Result<(), ()> {
+    let client_kind = match principal.auth {
+        bp_ent_core::AuthKind::Session => "web",
+        _ => "desktop",
+    };
+    let Ok(mut tx) = state.ctx.db.tenant_tx(principal.tenant_id).await else {
+        return Err(());
+    };
+    if sqlx::query(
+        "INSERT INTO boat_relay_sessions (id, tenant_id, vm_id, user_id, client_kind) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(session_id)
+    .bind(principal.tenant_id.0)
+    .bind(vm_id)
+    .bind(principal.user_id.0)
+    .bind(client_kind)
+    .execute(&mut *tx)
+    .await
+    .is_err()
+    {
+        return Err(());
+    }
+    if audit::append(
+        &mut tx,
+        principal,
+        "boat_vm.relay_connected",
+        &format!("vm:{vm_id}"),
+        serde_json::json!({ "session_id": session_id, "client_kind": client_kind }),
+    )
+    .await
+    .is_err()
+    {
+        return Err(());
+    }
+    tx.commit().await.map_err(|_| ())
+}
+
+async fn close_desktop_session_record(
+    state: &RelayState,
+    principal: &Principal,
+    vm_id: Uuid,
+    session_id: Uuid,
+    reason: &str,
+) {
+    let tenant_id = principal.tenant_id;
+    if let Ok(mut tx) = state.ctx.db.tenant_tx(tenant_id).await {
+        let _ = sqlx::query(
+            "UPDATE boat_relay_sessions SET disconnected_at = now() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await;
+        let _ = sqlx::query(
+            "UPDATE boat_vms SET last_active_at = now() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(vm_id)
+        .execute(&mut *tx)
+        .await;
+        let _ = audit::append(
+            &mut tx,
+            principal,
+            "boat_vm.relay_disconnected",
+            &format!("vm:{vm_id}"),
+            serde_json::json!({ "session_id": session_id, "reason": reason }),
+        )
+        .await;
+        let _ = tx.commit().await;
+    }
 }
 
 async fn handle_desktop_socket(
@@ -1049,23 +1207,77 @@ async fn handle_desktop_socket(
         }
     };
 
+    if open_desktop_session_record(&state, &principal, vm_id, session_id)
+        .await
+        .is_err()
+    {
+        state.registry.detach_client(tenant_id, vm_id, session_id).await;
+        let _ = socket.close().await;
+        close_desktop_session_record(&state, &principal, vm_id, session_id, "record_failed").await;
+        return;
+    }
+
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut recheck = tokio::time::interval(RECHECK_INTERVAL);
     recheck.tick().await;
+    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
     let mut last_activity_touch = Instant::now();
+    let mut last_rx = Instant::now();
+    let mut rate = FrameRateLimiter::new(MAX_FRAMES_PER_MIN, MAX_BYTES_PER_MIN);
 
     loop {
         tokio::select! {
-            maybe_frame = from_vm_rx.recv() => {
-                let Some(frame) = maybe_frame else { break; };
-                let Ok(json) = frame.encode_json() else { break; };
-                if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            maybe_pkt = from_vm_rx.recv() => {
+                let Some(pkt) = maybe_pkt else { break; };
+                let ok = match pkt {
+                    TunnelPacket::Bin(bytes) => send_ws_timed(&mut ws_tx, Message::Binary(bytes.into())).await,
+                    TunnelPacket::Json(frame) => {
+                        let Ok(json) = frame.encode_json() else { break; };
+                        send_ws_timed(&mut ws_tx, Message::Text(json.into())).await
+                    }
+                };
+                if !ok {
                     break;
                 }
             }
             maybe_msg = ws_rx.next() => {
                 match maybe_msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        last_rx = Instant::now();
+                        if !rate.allow(bytes.len()) {
+                            tracing::warn!(%tenant_id, %vm_id, "desktop tunnel rate limit exceeded");
+                            let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
+                            break;
+                        }
+                        if let Ok(ch) = RelayFrame::validate_bin_header(&bytes) {
+                            if matches!(ch, RelayChannel::HealthPing) {
+                                state.registry.touch_heartbeat(tenant_id, vm_id).await;
+                            }
+                            if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_THROTTLE {
+                                last_activity_touch = Instant::now();
+                                touch_vm_activity(&state.ctx, tenant_id, vm_id).await;
+                            }
+                            if !matches!(
+                                tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    to_vm_tx.send(TunnelPacket::Bin(bytes.to_vec())),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ) {
+                                break;
+                            }
+                        }
+                    }
                     Some(Ok(Message::Text(txt))) => {
+                        last_rx = Instant::now();
+                        if !rate.allow(txt.len()) {
+                            tracing::warn!(%tenant_id, %vm_id, "desktop tunnel rate limit exceeded");
+                            let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
+                            break;
+                        }
                         if let Ok(frame) = RelayFrame::decode_json(&txt) {
                             if matches!(frame.channel, RelayChannel::HealthPing) {
                                 state.registry.touch_heartbeat(tenant_id, vm_id).await;
@@ -1074,24 +1286,43 @@ async fn handle_desktop_socket(
                                 last_activity_touch = Instant::now();
                                 touch_vm_activity(&state.ctx, tenant_id, vm_id).await;
                             }
-                            if to_vm_tx.send(frame).await.is_err() {
+                            if !matches!(
+                                tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    to_vm_tx.send(TunnelPacket::Json(frame)),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ) {
                                 break;
                             }
                         }
                     }
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                        last_rx = Instant::now();
+                    }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
+                }
+            }
+            _ = ping.tick() => {
+                if last_rx.elapsed() > WS_IDLE_TIMEOUT {
+                    tracing::warn!(%tenant_id, %vm_id, "desktop websocket idle timeout");
+                    let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
+                    break;
+                }
+                if !send_ws_timed(&mut ws_tx, Message::Ping(Vec::new().into())).await {
+                    break;
                 }
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                    let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
                     break;
                 }
             }
             _ = recheck.tick() => {
                 if !desktop_session_still_valid(&state, &principal, vm_id).await {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                    let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
                     break;
                 }
             }
@@ -1103,23 +1334,7 @@ async fn handle_desktop_socket(
         .detach_client(tenant_id, vm_id, session_id)
         .await;
 
-    if let Ok(mut tx) = state.ctx.db.tenant_tx(tenant_id).await {
-        let _ = sqlx::query(
-            "UPDATE boat_relay_sessions SET disconnected_at = now() WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id.0)
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await;
-        let _ = sqlx::query(
-            "UPDATE boat_vms SET last_active_at = now() WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id.0)
-        .bind(vm_id)
-        .execute(&mut *tx)
-        .await;
-        let _ = tx.commit().await;
-    }
+    close_desktop_session_record(&state, &principal, vm_id, session_id, "closed").await;
 }
 
 /// Boat VM outbound mTLS tunnel endpoint.
@@ -1240,48 +1455,101 @@ async fn handle_boat_socket(
 
     let mut recheck = tokio::time::interval(RECHECK_INTERVAL);
     recheck.tick().await;
+    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
     let mut last_activity_touch = Instant::now();
+    let mut last_rx = Instant::now();
+    let mut rate = FrameRateLimiter::new(MAX_FRAMES_PER_MIN, MAX_BYTES_PER_MIN);
 
     loop {
         tokio::select! {
-            maybe_frame = from_clients_rx.recv() => {
-                let Some(frame) = maybe_frame else { break; };
-                let Ok(json) = frame.encode_json() else { break; };
-                if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            maybe_pkt = from_clients_rx.recv() => {
+                let Some(pkt) = maybe_pkt else { break; };
+                let ok = match pkt {
+                    TunnelPacket::Bin(bytes) => send_ws_timed(&mut ws_tx, Message::Binary(bytes.into())).await,
+                    TunnelPacket::Json(frame) => {
+                        let Ok(json) = frame.encode_json() else { break; };
+                        send_ws_timed(&mut ws_tx, Message::Text(json.into())).await
+                    }
+                };
+                if !ok {
                     break;
                 }
             }
             maybe_msg = ws_rx.next() => {
                 match maybe_msg {
-                    Some(Ok(Message::Text(txt))) => {
-                        if let Ok(frame) = RelayFrame::decode_json(&txt) {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        last_rx = Instant::now();
+                        if !rate.allow(bytes.len()) {
+                            tracing::warn!(tenant_id = %identity.tenant_id, vm_id = %identity.vm_id, "boat tunnel rate limit exceeded");
+                            let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
+                            break;
+                        }
+                        if let Ok(ch) = RelayFrame::validate_bin_header(&bytes) {
+                            if matches!(ch, RelayChannel::HealthPing) {
+                                state.registry.touch_heartbeat(identity.tenant_id, identity.vm_id).await;
+                            }
                             if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_THROTTLE {
                                 last_activity_touch = Instant::now();
                                 touch_vm_activity(&state.ctx, identity.tenant_id, identity.vm_id).await;
                             }
                             let _ = state
                                 .registry
-                                .forward_from_vm(identity.tenant_id, identity.vm_id, frame)
+                                .forward_from_vm(identity.tenant_id, identity.vm_id, TunnelPacket::Bin(bytes.to_vec()))
                                 .await;
                         }
                     }
+                    Some(Ok(Message::Text(txt))) => {
+                        last_rx = Instant::now();
+                        if !rate.allow(txt.len()) {
+                            tracing::warn!(tenant_id = %identity.tenant_id, vm_id = %identity.vm_id, "boat tunnel rate limit exceeded");
+                            let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
+                            break;
+                        }
+                        if let Ok(frame) = RelayFrame::decode_json(&txt) {
+                            if matches!(frame.channel, RelayChannel::HealthPing) {
+                                state.registry.touch_heartbeat(identity.tenant_id, identity.vm_id).await;
+                            }
+                            if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_THROTTLE {
+                                last_activity_touch = Instant::now();
+                                touch_vm_activity(&state.ctx, identity.tenant_id, identity.vm_id).await;
+                            }
+                            let _ = state
+                                .registry
+                                .forward_from_vm(identity.tenant_id, identity.vm_id, TunnelPacket::Json(frame))
+                                .await;
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                        last_rx = Instant::now();
+                    }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
+                }
+            }
+            _ = ping.tick() => {
+                if last_rx.elapsed() > WS_IDLE_TIMEOUT {
+                    tracing::warn!(tenant_id = %identity.tenant_id, vm_id = %identity.vm_id, "boat websocket idle timeout");
+                    let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
+                    break;
+                }
+                if !send_ws_timed(&mut ws_tx, Message::Ping(Vec::new().into())).await {
+                    break;
                 }
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                    let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
                     break;
                 }
             }
             _ = &mut cert_expiry_sleep => {
-                let _ = ws_tx.send(Message::Close(None)).await;
+                let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
                 break;
             }
             _ = recheck.tick() => {
                 if !boat_cert_and_vm_still_valid(&state, &identity).await {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                    let _ = send_ws_timed(&mut ws_tx, Message::Close(None)).await;
                     break;
                 }
             }
@@ -1292,4 +1560,71 @@ async fn handle_boat_socket(
         .registry
         .unregister_vm(identity.tenant_id, identity.vm_id, session_id)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bp_ent_core::rbac::Scopes;
+    use bp_ent_core::{Role, UserId};
+
+    fn make_principal(tenant_id: TenantId, user_id: UserId, role: Role, auth: AuthKind) -> Principal {
+        Principal {
+            tenant_id,
+            user_id,
+            role,
+            email: "u@example.test".into(),
+            auth,
+            scopes: Scopes::All,
+            token_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn check_vm_connect_access_enforces_strict_per_user_and_token_isolation() {
+        let tenant = TenantId::new();
+        let owner = UserId::new();
+        let other_eng = UserId::new();
+        let admin = UserId::new();
+
+        let p_owner = make_principal(tenant, owner, Role::Engineer, AuthKind::UserToken);
+        let p_other = make_principal(tenant, other_eng, Role::Engineer, AuthKind::UserToken);
+        let p_admin = make_principal(tenant, admin, Role::OrgAdmin, AuthKind::UserToken);
+        let p_device = make_principal(tenant, owner, Role::OrgAdmin, AuthKind::DeviceToken);
+
+        // Assigned VM: ONLY the assigned owner may connect (not even OrgAdmin).
+        assert!(check_vm_connect_access(&p_owner, Some(owner.0)).is_ok());
+        assert_eq!(
+            check_vm_connect_access(&p_other, Some(owner.0)).unwrap_err().status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            check_vm_connect_access(&p_admin, Some(owner.0)).unwrap_err().status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            check_vm_connect_access(&p_device, Some(owner.0)).unwrap_err().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+
+        // Unassigned VM: requires VmManage (admin ok, engineer forbidden).
+        assert!(check_vm_connect_access(&p_admin, None).is_ok());
+        assert_eq!(
+            check_vm_connect_access(&p_owner, None).unwrap_err().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn frame_rate_limiter_blocks_excess_frames() {
+        let mut r = FrameRateLimiter::new(3, 100);
+        assert!(r.allow(10));
+        assert!(r.allow(10));
+        assert!(r.allow(10));
+        assert!(!r.allow(10));
+
+        let mut b = FrameRateLimiter::new(100, 50);
+        assert!(b.allow(30));
+        assert!(!b.allow(21));
+    }
 }

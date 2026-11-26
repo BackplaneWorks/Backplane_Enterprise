@@ -168,6 +168,7 @@ async fn handle_connection(
     tcp: tokio::net::TcpStream,
     peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
+    let _ = tcp.set_nodelay(true);
     let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
         .await
         .map_err(|_| anyhow::anyhow!("mTLS handshake timeout from {peer_addr}"))??;

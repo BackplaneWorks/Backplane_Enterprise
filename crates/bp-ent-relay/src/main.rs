@@ -7,7 +7,10 @@
 
 use anyhow::{bail, Context};
 use bp_ent_core::{config::env_parse, AppCtx};
-use bp_ent_relay::{bridge, reap_idle_vms, router_with_state, MtlsRelayServer, RelayConfig, RelayState};
+use bp_ent_relay::{
+    bridge, client_router_with_state, mtls_router_with_state, reap_idle_vms, MtlsRelayServer,
+    RelayConfig, RelayState,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -87,8 +90,9 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     let mtls_hosts = if mtls_hosts.is_empty() { vec!["localhost"] } else { mtls_hosts };
 
-    let app = router_with_state(state.clone());
-    let mtls_server = MtlsRelayServer::new(&state.ca, &mtls_hosts, app.clone())?;
+    let client_app = client_router_with_state(state.clone());
+    let mtls_app = mtls_router_with_state(state.clone());
+    let mtls_server = MtlsRelayServer::new(&state.ca, &mtls_hosts, mtls_app)?;
 
     let client_listener = TcpListener::bind(client_addr).await?;
     let mtls_listener = TcpListener::bind(mtls_addr).await?;
@@ -114,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::try_join!(
         async {
-            axum::serve(client_listener, app)
+            axum::serve(client_listener, client_app)
                 .await
                 .map_err(anyhow::Error::from)
         },
