@@ -614,6 +614,11 @@ fn content_type(kind: &str) -> Option<&'static str> {
         "pcb_svg" | "schematic_svg" => "image/svg+xml",
         "model_glb" => "model/gltf-binary",
         "model_step" => "application/step",
+        "solidcraft" => "application/zip",
+        "model_stl" => "model/stl",
+        "model_3mf" => "model/3mf",
+        "model_iges" => "model/iges",
+        "model_obj" => "model/obj",
         "gerbers_zip" => "application/zip",
         "bom_csv" => "text/csv; charset=utf-8",
         "kicad_pcb" | "kicad_sch" => "application/octet-stream",
@@ -991,5 +996,11 @@ mod tests {
         assert!(validate_components(&[c("R1", "F.Cu", f64::NAN)]).is_err());
         assert!(validate_components(&[c("<script>", "F.Cu", 1.0)]).is_err());
         assert!(valid_artifact_name("F.Cu") && valid_artifact_name("") && !valid_artifact_name("../x") && !valid_artifact_name("a b"));
+        assert_eq!(content_type("solidcraft"), Some("application/zip"));
+        assert_eq!(content_type("model_stl"), Some("model/stl"));
+        assert_eq!(content_type("model_3mf"), Some("model/3mf"));
+        assert_eq!(content_type("model_iges"), Some("model/iges"));
+        assert_eq!(content_type("model_obj"), Some("model/obj"));
+        assert_eq!(content_type("exe"), None);
     }
 }

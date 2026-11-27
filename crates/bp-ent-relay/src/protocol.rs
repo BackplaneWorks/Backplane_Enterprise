@@ -31,6 +31,7 @@ pub enum RelayChannel {
     KicadIpc = 2,
     BuildLogs = 3,
     HealthPing = 4,
+    SolidcraftIpc = 5,
 }
 
 impl RelayChannel {
@@ -41,6 +42,7 @@ impl RelayChannel {
             2 => Ok(Self::KicadIpc),
             3 => Ok(Self::BuildLogs),
             4 => Ok(Self::HealthPing),
+            5 => Ok(Self::SolidcraftIpc),
             _ => Err(Error::invalid("disallowed relay channel")),
         }
     }
@@ -201,6 +203,15 @@ mod tests {
 
         // Oversized payload rejected.
         assert!(RelayFrame::new(RelayChannel::FileSync, vec![0u8; MAX_FRAME_BYTES + 1]).is_err());
+
+        // SolidCraft IPC channel is allowlisted and round-trips in JSON and binary.
+        let sc = RelayFrame::new(RelayChannel::SolidcraftIpc, b"{\"method\":\"engine.execute\"}".to_vec()).unwrap();
+        let sc_json = sc.encode_json().unwrap();
+        assert!(sc_json.contains("\"solidcraft_ipc\""));
+        assert_eq!(RelayFrame::decode_json(&sc_json).unwrap(), sc);
+        let sc_bin = sc.encode_bin().unwrap();
+        assert_eq!(RelayFrame::validate_bin_header(&sc_bin).unwrap(), RelayChannel::SolidcraftIpc);
+        assert_eq!(RelayFrame::decode_bin(&sc_bin).unwrap(), sc);
     }
 
     #[test]
